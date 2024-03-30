@@ -17,7 +17,7 @@ from thriftpy2.contrib.aio.socket import TAsyncSocket
 from thriftpy2.contrib.aio.transport import TAsyncFramedTransportFactory, TAsyncBufferedTransportFactory
 from thriftpy2.contrib.aio.protocol import TAsyncBinaryProtocolFactory
 
-from thriftpy2.transport.framed import TFramedTransportFactory
+from lru import LRU
 
 import thriftpy2
 
@@ -32,9 +32,6 @@ TRANSPORT_FACTORY = TAsyncFramedTransportFactory()
 PROTOCOL_FACTORY = TAsyncBinaryProtocolFactory()
 
 rocksdb_thrift = thriftpy2.load(str((pathlib.Path(__file__).parent / pathlib.Path("rocksdb.thrift")).resolve(strict=False)), module_name="rocksdb_thrift")
-
-from thriftpy2.rpc import make_aio_client
-
 
 class PeerType(Enum):
     """ Pyrogram peer types """
@@ -112,6 +109,9 @@ class RockServerStorage(Storage):
         self._port = port
 
         self._save_user_peers = save_user_peers
+
+        self._username_to_id = LRU(100_000)
+        self._phone_to_id = LRU(100_000)
 
         super().__init__(name=self._session_id)
 
@@ -218,12 +218,21 @@ class RockServerStorage(Storage):
             keys_multi = []
             value_multi = []
             for deduplicated_peer in deduplicated_peers:
-                keys = [deduplicated_peer[0].to_bytes(8, byteorder='big', signed=True)]
-                value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2], deduplicated_peer[3],
-                                               deduplicated_peer[4], deduplicated_peer[5])
+                peer_id = deduplicated_peer[0]
+                username = deduplicated_peer[3]
+                phone_number = deduplicated_peer[4]
+
+                keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+                value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2], username,
+                                               phone_number, deduplicated_peer[5])
                 value = bson.dumps(value_tuple)
                 keys_multi.append(keys)
                 value_multi.append(value)
+
+                if username is not None:
+                    self._username_to_id[username] = peer_id
+                if phone_number is not None:
+                    self._phone_to_id[phone_number] = peer_id
 
             await self._client.putMulti(0, self._peer_col, keys_multi, value_multi)
 
@@ -240,10 +249,31 @@ class RockServerStorage(Storage):
         return get_input_peer(value_tuple)
 
     async def get_peer_by_username(self, username: str):
-        raise KeyError("get_peer_by_username is not supported with rocksdb storage")
+        peer_id = self._username_to_id.get(username)
+
+        if peer_id is None:
+            raise KeyError(f"Username not found: {username}")
+
+        keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+        encoded_value = await fetchone(self._client, self._peer_col, keys)
+        value_tuple = decode_peer_info(peer_id, encoded_value)
+
+        if int(time.time() - value_tuple['last_update_on']) > self.USERNAME_TTL:
+            raise KeyError(f"Username expired: {username}")
+
+        return get_input_peer(value_tuple)
 
     async def get_peer_by_phone_number(self, phone_number: str):
-        raise KeyError("get_peer_by_username is not supported with rocksdb storage")
+        peer_id = self._phone_to_id.get(phone_number)
+
+        if peer_id is None:
+            raise KeyError(f"Phone number not found: {phone_number}")
+
+        keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+        encoded_value = await fetchone(self._client, self._peer_col, keys)
+        value_tuple = decode_peer_info(peer_id, encoded_value)
+
+        return get_input_peer(value_tuple)
 
     async def _set(self, column, value: Any):
         update_begin = await self._client.getForUpdate(0, self._session_col, SESSION_KEY)
