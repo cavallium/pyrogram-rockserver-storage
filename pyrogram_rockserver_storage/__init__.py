@@ -45,7 +45,7 @@ def encode_peer_info(access_hash: int, peer_type: str, username: str, phone_numb
     return {"access_hash": access_hash, "peer_type": peer_type, "username": username, "phone_number": phone_number, "last_update_on": last_update_on}
 
 def decode_peer_info(peer_id: int, value):
-    return {"id": peer_id, "access_hash": value["access_hash"], "peer_type": value["peer_type"]} if value is not None else None
+    return {"id": peer_id, "access_hash": value["access_hash"], "peer_type": value["peer_type"], "username": value["username"], "phone_number": ["phone_number"], "last_update_on": value["last_update_on"]} if value is not None else None
 
 def get_input_peer(peer):
     """ This function is almost blindly copied from pyrogram sqlite storage"""
