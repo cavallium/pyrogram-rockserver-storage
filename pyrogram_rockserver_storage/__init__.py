@@ -258,6 +258,9 @@ class RockServerStorage(Storage):
         encoded_value = await fetchone(self._client, self._peer_col, keys)
         value_tuple = decode_peer_info(peer_id, encoded_value)
 
+        if value_tuple is None:
+            raise KeyError(f"Username not found: {username}")
+
         if int(time.time() - value_tuple['last_update_on']) > self.USERNAME_TTL:
             raise KeyError(f"Username expired: {username}")
 
