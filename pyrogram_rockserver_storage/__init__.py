@@ -101,7 +101,7 @@ class RockServerStorage(Storage):
         self._session_col = None
         self._peer_col = None
         self._session_id = f'{session_unique_name}'
-        self._session_data = None
+        self._session_data = {"dc_id": 2, "api_id": None, "test_mode": None, "auth_key": None, "date": 0, "user_id": None, "is_bot": None, "phone": None}
         self._client = None
         self._hostname = hostname
         self._port = port
@@ -133,8 +133,6 @@ class RockServerStorage(Storage):
         self._peer_col = await self._client.createColumn(name=f'peers_{self._session_id}', schema=rocksdb_thrift.ColumnSchema(fixedKeys=[8], variableTailKeys=[], hasValue=True))
 
         self._session_data = await fetchone(self._client, self._session_col, SESSION_KEY)
-        if self._session_data is None:
-            self._session_data = {"dc_id": 2, "api_id": None, "test_mode": None, "auth_key": None, "date": 0, "user_id": None, "is_bot": None, "phone": None}
 
     async def save(self):
         """ On save we update the date """
@@ -204,7 +202,8 @@ class RockServerStorage(Storage):
     async def _set(self, column, value: Any):
         update_begin = await self._client.getForUpdate(0, self._session_col, SESSION_KEY)
         try:
-            session_data = bson.loads(update_begin.previous) if update_begin.previous is not None else self._session_data
+            decoded_bson_session_data = bson.loads(update_begin.previous) if update_begin.previous is not None else None
+            session_data = decoded_bson_session_data if decoded_bson_session_data is not None else self._session_data
             session_data[column] = value
             encoded_session_data = bson.dumps(session_data)
             await self._client.put(update_begin.updateId, self._session_col, SESSION_KEY, encoded_session_data)
