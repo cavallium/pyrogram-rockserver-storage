@@ -21,6 +21,8 @@ import thriftpy2
 import bson
 from thriftpy2.contrib.aio.client import TAsyncClient
 
+from pyrogram_rockserver_storage.TParallelAsyncClient import TParallelAsyncClient
+
 SESSION_KEY = [bytes([0])]
 DIGITS = set(digits)
 TRANSPORT_FACTORY = TAsyncFramedTransportFactory()
@@ -112,7 +114,7 @@ class RockServerStorage(Storage):
 
     async def open(self):
         """ Initialize pyrogram session"""
-        self._client = await make_aio_client(rocksdb_thrift.RocksDB, host=self._hostname, port=self._port, trans_factory=TRANSPORT_FACTORY, proto_factory=PROTOCOL_FACTORY, connect_timeout=8000)
+        self._client = TParallelAsyncClient(await make_aio_client(rocksdb_thrift.RocksDB, host=self._hostname, port=self._port, trans_factory=TRANSPORT_FACTORY, proto_factory=PROTOCOL_FACTORY, connect_timeout=8000))
 
         # Column('dc_id', BIGINT, primary_key=True),
         # Column('api_id', BIGINT),
