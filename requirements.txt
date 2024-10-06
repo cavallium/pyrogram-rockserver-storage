@@ -1,4 +1,4 @@
 Pyrogram @ git+https://github.com/cavallium/faster-pyrogram@847a353ce65b9b7edaef9a05eb71b20f107d67da
 bson~=0.5.10
-thriftpy2~=0.4.20
+thriftpy2~=0.5.2
 lru-dict~=1.3.0

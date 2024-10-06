@@ -42,7 +42,7 @@ service RocksDB {
 
    i64 openTransaction(1: required i64 timeoutMs),
 
-   bool closeTransaction(1: required i64 timeoutMs, 2: required bool commit),
+   bool closeTransaction(1: required i64 transactionId, 2: required bool commit),
 
    void closeFailedUpdate(1: required i64 updateId),
 
