@@ -111,6 +111,7 @@ class RockServerStorage(Storage):
         self._save_user_peers = save_user_peers
 
         self._username_to_id = LRU(100_000)
+        self._update_to_state = LRU(100_000)
         self._phone_to_id = LRU(100_000)
 
         super().__init__(name=self._session_id)
@@ -236,6 +237,22 @@ class RockServerStorage(Storage):
 
             await self._client.putMulti(0, self._peer_col, keys_multi, value_multi)
 
+    async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
+        for t in usernames:
+            id_ = t[0]
+            id_usernames = t[1]
+            for username in id_usernames:
+                self._username_to_id[username] = id_
+
+    async def update_state(self, value: Tuple[int, int, int, int, int] = object):
+        if value == object:
+            return sorted(self._update_to_state.values(), key=lambda x: x[3], reverse=False)
+        else:
+            if isinstance(value, int):
+                self._update_to_state.pop(value)
+            else:
+                self._update_to_state[value[0]] = value
+
     async def get_peer_by_id(self, peer_id: int):
         if isinstance(peer_id, str) or (not self._save_user_peers and peer_id > 0):
             raise KeyError(f"ID not found: {peer_id}")
@@ -317,4 +334,3 @@ class RockServerStorage(Storage):
 
     async def is_bot(self, value: bool = object):
         return await self._accessor('is_bot', value)
-
