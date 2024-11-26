@@ -194,7 +194,7 @@ class RockServerStorage(Storage):
 
     async def delete(self):
         """ Delete all the tables and indexes """
-        await self._client.deleteColumn(self._session_id)
+        await self._client.deleteColumn(self._session_col)
         await self._client.deleteColumn(self._peer_col)
 
     # peer_id, access_hash, peer_type, phone_number
