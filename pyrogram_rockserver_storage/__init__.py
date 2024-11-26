@@ -41,11 +41,11 @@ class PeerType(Enum):
     CHANNEL = 'channel'
     SUPERGROUP = 'supergroup'
 
-def encode_peer_info(access_hash: int, peer_type: str, username: str, phone_number: str, last_update_on: int):
-    return {"access_hash": access_hash, "peer_type": peer_type, "username": username, "phone_number": phone_number, "last_update_on": last_update_on}
+def encode_peer_info(access_hash: int, peer_type: str, phone_number: str, last_update_on: int):
+    return {"access_hash": access_hash, "peer_type": peer_type, "phone_number": phone_number, "last_update_on": last_update_on}
 
 def decode_peer_info(peer_id: int, value):
-    return {"id": peer_id, "access_hash": value["access_hash"], "peer_type": value["peer_type"], "username": value["username"], "phone_number": ["phone_number"], "last_update_on": value["last_update_on"]} if value is not None else None
+    return {"id": peer_id, "access_hash": value["access_hash"], "peer_type": value["peer_type"], "phone_number": ["phone_number"], "last_update_on": value["last_update_on"]} if value is not None else None
 
 def get_input_peer(peer):
     """ This function is almost blindly copied from pyrogram sqlite storage"""
@@ -194,7 +194,8 @@ class RockServerStorage(Storage):
         await self._client.deleteColumn(self._session_id)
         await self._client.deleteColumn(self._peer_col)
 
-    async def update_peers(self, peers: List[Tuple[int, int, str, str, str]]):
+    # peer_id, access_hash, peer_type, phone_number
+    async def update_peers(self, peers: List[Tuple[int, int, str, str]]):
         """ Copied and adopted from pyro sqlite storage"""
         if not peers:
             return
@@ -220,18 +221,15 @@ class RockServerStorage(Storage):
             value_multi = []
             for deduplicated_peer in deduplicated_peers:
                 peer_id = deduplicated_peer[0]
-                username = deduplicated_peer[3]
-                phone_number = deduplicated_peer[4]
+                phone_number = deduplicated_peer[3]
 
                 keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
-                value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2], username,
-                                               phone_number, deduplicated_peer[5])
+                value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
+                                               phone_number, deduplicated_peer[4])
                 value = bson.dumps(value_tuple)
                 keys_multi.append(keys)
                 value_multi.append(value)
 
-                if username is not None:
-                    self._username_to_id[username] = peer_id
                 if phone_number is not None:
                     self._phone_to_id[phone_number] = peer_id
 
@@ -239,10 +237,10 @@ class RockServerStorage(Storage):
 
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
         for t in usernames:
-            id_ = t[0]
+            peer_id = t[0]
             id_usernames = t[1]
             for username in id_usernames:
-                self._username_to_id[username] = id_
+                self._username_to_id[username] = peer_id
 
     async def update_state(self, value: Tuple[int, int, int, int, int] = object):
         if value == object:
