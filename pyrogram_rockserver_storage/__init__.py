@@ -187,7 +187,10 @@ class RockServerStorage(Storage):
 
     async def close(self):
         """ Close transport """
-        await self._client.close()
+        if self._client is not None:
+            close_future = self._client.close()
+            if close_future is not None:
+                await close_future
 
     async def delete(self):
         """ Delete all the tables and indexes """
