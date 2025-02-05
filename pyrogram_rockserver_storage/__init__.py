@@ -168,7 +168,7 @@ class RockServerStorage(Storage):
         # Column('user_id', BIGINT),
         # Column('is_bot', Boolean),
         # Column('phone', String(length=50)
-        self._session_col = await self._client.createColumn(name=f'pyrogram_session_{self._session_id}', schema=rocksdb_thrift.ColumnSchema(fixedKeys=[1], variableTailKeys=[], hasValue=True))
+        await self.create_sessions_col()
 
         # Column('id', BIGINT),
         # Column('access_hash', BIGINT),
@@ -176,10 +176,16 @@ class RockServerStorage(Storage):
         # Column('username', String),
         # Column('phone_number', String),
         # Column('last_update_on', BIGINT),
-        self._peer_col = await self._client.createColumn(name=f'peers_{self._session_id}', schema=rocksdb_thrift.ColumnSchema(fixedKeys=[8], variableTailKeys=[], hasValue=True))
+        await self.create_data_cols()
 
         fetched_session_data = await fetchone(self._client, self._session_col, SESSION_KEY)
         self._session_data = fetched_session_data if fetched_session_data is not None else self._session_data
+
+    async def create_sessions_col(self):
+        self._session_col = await self._client.createColumn(name=f'pyrogram_session_{self._session_id}', schema=rocksdb_thrift.ColumnSchema(fixedKeys=[1], variableTailKeys=[], hasValue=True))
+
+    async def create_data_cols(self):
+        self._peer_col = await self._client.createColumn(name=f'peers_{self._session_id}', schema=rocksdb_thrift.ColumnSchema(fixedKeys=[8], variableTailKeys=[], hasValue=True))
 
     async def save(self):
         """ On save we update the date """
@@ -196,10 +202,12 @@ class RockServerStorage(Storage):
         """ Delete all the tables and indexes """
         await self.delete_data()
         await self._client.deleteColumn(self._session_col)
+        await self.create_sessions_col()
 
     async def delete_data(self):
         """ Delete only data, keep session """
         await self._client.deleteColumn(self._peer_col)
+        await self.create_data_cols()
 
     # peer_id, access_hash, peer_type, phone_number
     async def update_peers(self, peers: List[Tuple[int, int, str, str]]):
