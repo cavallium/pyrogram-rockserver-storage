@@ -240,7 +240,16 @@ class RockServerStorage(Storage):
                 if phone_number is not None:
                     self._phone_to_id[phone_number] = peer_id
 
-            await self._client.putMulti(0, self._peer_col, keys_multi, value_multi)
+            failed = True
+            while failed:
+                try:
+                    await self._client.putMulti(0, self._peer_col, keys_multi, value_multi)
+                    failed = False
+                except Exception as e:
+                    print("Failed to update peers in rocksdb, retrying...", e)
+                    failed = True
+                if failed:
+                    await asyncio.sleep(1)
 
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
         for t in usernames:
@@ -301,20 +310,30 @@ class RockServerStorage(Storage):
         return get_input_peer(value_tuple)
 
     async def _set(self, column, value: Any):
-        update_begin = await self._client.getForUpdate(0, self._session_col, SESSION_KEY)
-        try:
-            decoded_bson_session_data = bson.loads(update_begin.previous) if update_begin.previous is not None else None
-            session_data = decoded_bson_session_data if decoded_bson_session_data is not None else self._session_data
-            session_data[column] = value
-            encoded_session_data = bson.dumps(session_data)
-            await self._client.put(update_begin.updateId, self._session_col, SESSION_KEY, encoded_session_data)
-        except:
-            print("Failed to update session in rocksdb, cancelling the update transaction...")
-            try:
-                await self._client.closeFailedUpdate(update_begin.updateId)
-            except:
-                pass
         self._session_data[column] = value  # update local copy
+        failed = True
+        while failed:
+            update_begin = await self._client.getForUpdate(0, self._session_col, SESSION_KEY)
+            try:
+                decoded_bson_session_data = bson.loads(
+                    update_begin.previous) if update_begin.previous is not None else None
+                if decoded_bson_session_data is not None:
+                    session_data = decoded_bson_session_data
+                    session_data[column] = value
+                else:
+                    session_data = self._session_data
+                encoded_session_data = bson.dumps(session_data)
+                await self._client.put(update_begin.updateId, self._session_col, SESSION_KEY, encoded_session_data)
+                failed = False
+            except Exception as e:
+                print("Failed to update session in rocksdb, cancelling the update transaction and retrying...", e)
+                failed = True
+                try:
+                    await self._client.closeFailedUpdate(update_begin.updateId)
+                except:
+                    pass
+            if failed:
+                await asyncio.sleep(1)
 
     async def _accessor(self, column, value: Any = object):
         return self._session_data[column] if value == object else await self._set(column, value)
