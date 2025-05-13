@@ -198,7 +198,7 @@ class RockServerStorage(Storage):
                             keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
                             value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
                                                            phone_number, deduplicated_peer[4])
-                            value = bson.dumps(value_tuple)
+                            value: bytes = bson.dumps(value_tuple)
                             yield rockserver_storage_pb2.PutMultiRequest(data=rockserver_storage_pb2.KV(keys=keys, value=value))
 
                             if phone_number is not None:
@@ -283,7 +283,7 @@ class RockServerStorage(Storage):
                     session_data[column] = value
                 else:
                     session_data = self._session_data
-                encoded_session_data = bson.dumps(session_data)
+                encoded_session_data: bytes = bson.dumps(session_data)
                 await self._client.put(rockserver_storage_pb2.PutRequest(columnId=update_begin.updateId, transactionOrUpdateId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
                 failed = False
             except Exception as e:
