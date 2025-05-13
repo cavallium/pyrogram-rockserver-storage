@@ -111,7 +111,7 @@ class RockServerStorage(Storage):
 
     async def open(self):
         """ Initialize pyrogram session"""
-        self._channel = grpc.aio.insecure_channel(target=f'{self._hostname}:{self._port}', compression=grpc.Compression.Deflate)
+        self._channel = grpc.aio.insecure_channel(target=f'{self._hostname}:{self._port}', compression=grpc.Compression.Gzip)
         self._client = RocksDBServiceStub(self._channel)
 
         # Column('dc_id', BIGINT, primary_key=True),
