@@ -29,7 +29,7 @@ setup(
     author_email='nospam@warp.ovh',
     url='https://github.com/cavallium/pyrogram-rockserver-storage',
     packages=["pyrogram_rockserver_storage", ],
-    package_data={'': ['*.thrift']},
+    package_data={'': ['*.proto']},
     classifiers=[
         "Operating System :: OS Independent",
         'Intended Audience :: Developers',

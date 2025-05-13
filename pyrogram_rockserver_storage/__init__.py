@@ -2,36 +2,28 @@ __author__ = 'Andrea Cavalli'
 __version__ = '0.2'
 
 import asyncio
-import pathlib
 import time
 import urllib
 import warnings
 from enum import Enum
 from itertools import chain
 from string import digits
-from typing import Any, List, Tuple, Dict, Optional
+from typing import Any, List, Tuple, Dict, Optional, cast
 
+import grpc.aio
+from grpc import Channel
 from pyrogram import raw, utils
 from pyrogram.storage import Storage
-from thriftpy2.contrib.aio.socket import TAsyncSocket
-from thriftpy2.contrib.aio.transport import TAsyncFramedTransportFactory, TAsyncBufferedTransportFactory
-from thriftpy2.contrib.aio.protocol import TAsyncBinaryProtocolFactory
 
 from lru import LRU
 
-import thriftpy2
-
 import bson
-from thriftpy2.contrib.aio.client import TAsyncClient
 
-from pyrogram_rockserver_storage.TParallelAsyncClient import TParallelAsyncClient
+import pyrogram_rockserver_storage.rocksdb_pb2 as rockserver_storage_pb2
+from pyrogram_rockserver_storage.rocksdb_pb2_grpc import RocksDBServiceStub
 
 SESSION_KEY = [bytes([0])]
 DIGITS = set(digits)
-TRANSPORT_FACTORY = TAsyncFramedTransportFactory()
-PROTOCOL_FACTORY = TAsyncBinaryProtocolFactory()
-
-rocksdb_thrift = thriftpy2.load(str((pathlib.Path(__file__).parent / pathlib.Path("rocksdb.thrift")).resolve(strict=False)), module_name="rocksdb_thrift")
 
 class PeerType(Enum):
     """ Pyrogram peer types """
@@ -66,9 +58,9 @@ def get_input_peer(peer):
     raise ValueError(f"Invalid peer type: {peer['type']}")
 
 
-async def fetchone(client: TAsyncClient, column: int, keys: Any) -> Optional[Dict]:
+async def fetchone(client: rocksdb_pb2_grpc.RocksDBServiceStub, column: int, keys: Any) -> Optional[Dict]:
     """ Small helper - fetches a single row from provided query """
-    value = (await client.get(0, column, keys)).value
+    value = cast(rockserver_storage_pb2.GetResponse, await client.get(rockserver_storage_pb2.GetRequest(0, column, keys))).value
     value = bson.loads(value) if value else None
     return dict(value) if value else None
 
@@ -104,7 +96,8 @@ class RockServerStorage(Storage):
         self._peer_col = None
         self._session_id = f'{session_unique_name}'
         self._session_data = {"dc_id": 2, "api_id": None, "test_mode": None, "auth_key": None, "date": 0, "user_id": None, "is_bot": None, "phone": None}
-        self._client = None
+        self._channel: Channel | None = None
+        self._client: RocksDBServiceStub | None = None
         self._hostname = hostname
         self._port = port
 
@@ -116,49 +109,10 @@ class RockServerStorage(Storage):
 
         super().__init__(name=self._session_id)
 
-    async def make_parallel_aio_client(self, service, host='localhost', port=9090, unix_socket=None,
-                          proto_factory=TAsyncBinaryProtocolFactory(),
-                          trans_factory=TAsyncBufferedTransportFactory(),
-                          timeout=3000, connect_timeout=None,
-                          cafile=None, ssl_context=None,
-                          certfile=None, keyfile=None,
-                          validate=True, url='',
-                          socket_timeout=None):
-        if socket_timeout is not None:
-            warnings.warn(
-                "The 'socket_timeout' argument is deprecated. "
-                "Please use 'timeout' instead.",
-                DeprecationWarning,
-            )
-            timeout = socket_timeout
-        if url:
-            parsed_url = urllib.parse.urlparse(url)
-            host = parsed_url.hostname or host
-            port = parsed_url.port or port
-        if unix_socket:
-            socket = TAsyncSocket(unix_socket=unix_socket,
-                                  connect_timeout=connect_timeout,
-                                  socket_timeout=timeout)
-            if certfile:
-                warnings.warn("SSL only works with host:port, not unix_socket.")
-        elif host and port:
-            socket = TAsyncSocket(
-                host, port,
-                socket_timeout=timeout, connect_timeout=connect_timeout,
-                cafile=cafile, ssl_context=ssl_context,
-                certfile=certfile, keyfile=keyfile, validate=validate)
-        else:
-            raise ValueError("Either host/port or unix_socket"
-                             " or url must be provided.")
-
-        transport = trans_factory.get_transport(socket)
-        protocol = proto_factory.get_protocol(transport)
-        await transport.open()
-        return TParallelAsyncClient(service, protocol)
-
     async def open(self):
         """ Initialize pyrogram session"""
-        self._client = await self.make_parallel_aio_client(rocksdb_thrift.RocksDB, host=self._hostname, port=self._port, trans_factory=TRANSPORT_FACTORY, proto_factory=PROTOCOL_FACTORY, connect_timeout=8000)
+        self._channel = await grpc.aio.insecure_channel(target=f'{self._hostname}:{self._port}', compression=grpc.Compression.Deflate)
+        self._client = RocksDBServiceStub(self._channel)
 
         # Column('dc_id', BIGINT, primary_key=True),
         # Column('api_id', BIGINT),
@@ -182,10 +136,10 @@ class RockServerStorage(Storage):
         self._session_data = fetched_session_data if fetched_session_data is not None else self._session_data
 
     async def create_sessions_col(self):
-        self._session_col = await self._client.createColumn(name=f'pyrogram_session_{self._session_id}', schema=rocksdb_thrift.ColumnSchema(fixedKeys=[1], variableTailKeys=[], hasValue=True))
+        self._session_col = cast(rockserver_storage_pb2.CreateColumnResponse, await self._client.createColumn(rockserver_storage_pb2.CreateColumnRequest(name=f'pyrogram_session_{self._session_id}', schema=rockserver_storage_pb2.ColumnSchema(fixedKeys=[1], variableTailKeys=[], hasValue=True)))).columnId
 
     async def create_data_cols(self):
-        self._peer_col = await self._client.createColumn(name=f'peers_{self._session_id}', schema=rocksdb_thrift.ColumnSchema(fixedKeys=[8], variableTailKeys=[], hasValue=True))
+        self._peer_col = cast(rockserver_storage_pb2.CreateColumnResponse, await self._client.createColumn(rockserver_storage_pb2.CreateColumnRequest(name=f'peers_{self._session_id}', schema=rockserver_storage_pb2.ColumnSchema(fixedKeys=[8], variableTailKeys=[], hasValue=True)))).columnId
 
     async def save(self):
         """ On save we update the date """
@@ -194,19 +148,19 @@ class RockServerStorage(Storage):
     async def close(self):
         """ Close transport """
         if self._client is not None:
-            close_future = self._client.close()
+            close_future = self._channel.close()
             if close_future is not None:
                 await close_future
 
     async def delete(self):
         """ Delete all the tables and indexes """
         await self.delete_data()
-        await self._client.deleteColumn(self._session_col)
+        await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(self._session_col))
         await self.create_sessions_col()
 
     async def delete_data(self):
         """ Delete only data, keep session """
-        await self._client.deleteColumn(self._peer_col)
+        await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(self._peer_col))
         await self.create_data_cols()
 
     # peer_id, access_hash, peer_type, phone_number
@@ -232,26 +186,25 @@ class RockServerStorage(Storage):
 
         # construct insert query
         if deduplicated_peers:
-            keys_multi = []
-            value_multi = []
-            for deduplicated_peer in deduplicated_peers:
-                peer_id = deduplicated_peer[0]
-                phone_number = deduplicated_peer[3]
-
-                keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
-                value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
-                                               phone_number, deduplicated_peer[4])
-                value = bson.dumps(value_tuple)
-                keys_multi.append(keys)
-                value_multi.append(value)
-
-                if phone_number is not None:
-                    self._phone_to_id[phone_number] = peer_id
-
             failed = True
             while failed:
                 try:
-                    await self._client.putMulti(0, self._peer_col, keys_multi, value_multi)
+                    async def request_():
+                        initial_request = rockserver_storage_pb2.PutMultiInitialRequest(transactionOrUpdateId=0, columnId=self._peer_col)
+                        for deduplicated_peer in deduplicated_peers:
+                            peer_id = deduplicated_peer[0]
+                            phone_number = deduplicated_peer[3]
+
+                            keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+                            value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
+                                                           phone_number, deduplicated_peer[4])
+                            value = bson.dumps(value_tuple)
+                            yield rockserver_storage_pb2.PutMultiRequest(initialRequest=initial_request, data=rockserver_storage_pb2.KV(keys=keys, value=value))
+
+                            if phone_number is not None:
+                                self._phone_to_id[phone_number] = peer_id
+
+                    await self._client.putMulti(request_())
                     failed = False
                 except Exception as e:
                     print("Failed to update peers in rocksdb, retrying...", e)
@@ -321,7 +274,7 @@ class RockServerStorage(Storage):
         self._session_data[column] = value  # update local copy
         failed = True
         while failed:
-            update_begin = await self._client.getForUpdate(0, self._session_col, SESSION_KEY)
+            update_begin = cast(rockserver_storage_pb2.UpdateBegin, await self._client.getForUpdate(rockserver_storage_pb2.GetRequest(0, self._session_col, SESSION_KEY)))
             try:
                 decoded_bson_session_data = bson.loads(
                     update_begin.previous) if update_begin.previous is not None else None
@@ -331,13 +284,13 @@ class RockServerStorage(Storage):
                 else:
                     session_data = self._session_data
                 encoded_session_data = bson.dumps(session_data)
-                await self._client.put(update_begin.updateId, self._session_col, SESSION_KEY, encoded_session_data)
+                await self._client.put(rockserver_storage_pb2.PutRequest(update_begin.updateId, self._session_col, rockserver_storage_pb2.KV(SESSION_KEY, encoded_session_data)))
                 failed = False
             except Exception as e:
                 print("Failed to update session in rocksdb, cancelling the update transaction and retrying...", e)
                 failed = True
                 try:
-                    await self._client.closeFailedUpdate(update_begin.updateId)
+                    await self._client.closeFailedUpdate(rockserver_storage_pb2.CloseFailedUpdateRequest(update_begin.updateId))
                 except:
                     pass
             if failed:

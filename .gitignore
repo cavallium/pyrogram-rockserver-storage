@@ -60,3 +60,4 @@ MANIFEST
 .venv
 
 .vscode/
+/build/

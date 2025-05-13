@@ -1,0 +1,132 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+option java_multiple_files = true;
+package it.cavallium.rockserver.core.common.api.proto;
+
+message ColumnSchema {
+  repeated int32 fixedKeys = 1;
+  repeated ColumnHashType variableTailKeys = 2;
+  bool hasValue = 3;
+}
+
+enum ColumnHashType {
+  XXHASH32 = 0;
+  XXHASH8 = 1;
+  ALLSAME8 = 2;
+  FIXEDINTEGER32 = 3;
+}
+
+enum Operation {
+  NOTHING = 0;
+  PREVIOUS = 1;
+  CURRENT = 2;
+  FOR_UPDATE = 3;
+  EXISTS = 4;
+  DELTA = 5;
+  MULTI = 6;
+  CHANGED = 7;
+  PREVIOUS_PRESENCE = 8;
+}
+
+enum PutBatchMode {
+  WRITE_BATCH = 0;
+  WRITE_BATCH_NO_WAL = 1;
+  SST_INGESTION = 2;
+  SST_INGEST_BEHIND = 3;
+}
+
+message Delta {
+  optional bytes previous = 1;
+  optional bytes current = 2;
+}
+message Previous {optional bytes previous = 1;}
+message Changed {bool changed = 1;}
+message PreviousPresence {bool present = 1;}
+
+message UpdateBegin {
+  optional bytes previous = 1;
+  optional int64 updateId = 2;
+}
+
+message KV {
+  repeated bytes keys = 1;
+  bytes value = 2;
+}
+
+message KVBatch {
+  repeated KV entries = 1;
+}
+
+message OpenTransactionRequest {int64 timeoutMs = 1;}
+message OpenTransactionResponse {int64 transactionId = 1;}
+
+message CloseTransactionRequest {int64 transactionId = 1; int64 timeoutMs = 2; bool commit = 3;}
+message CloseTransactionResponse {bool successful = 1;}
+
+message CloseFailedUpdateRequest {int64 updateId = 1;}
+
+message CreateColumnRequest {string name = 1; ColumnSchema schema = 2;}
+message CreateColumnResponse {int64 columnId = 1;}
+
+message DeleteColumnRequest {int64 columnId = 1;}
+
+message GetColumnIdRequest {string name = 1;}
+message GetColumnIdResponse {int64 columnId = 1;}
+
+message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
+
+message PutBatchInitialRequest {int64 columnId = 1; PutBatchMode mode = 2;}
+message PutBatchRequest {oneof putBatchRequestType {PutBatchInitialRequest initialRequest = 1;KVBatch data = 2;}}
+
+message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
+message PutMultiRequest {oneof putMultiRequestType {PutMultiInitialRequest initialRequest = 1;KV data = 2;}}
+
+message GetRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
+message GetResponse {optional bytes value = 1;}
+
+message OpenIteratorRequest {int64 transactionId = 1; int64 columnId = 2; repeated bytes startKeysInclusive = 3; repeated bytes endKeysExclusive = 4; bool reverse = 5; int64 timeoutMs = 6;}
+message OpenIteratorResponse {int64 iteratorId = 1;}
+
+message CloseIteratorRequest {int64 iteratorId = 1;}
+
+message SeekToRequest {int64 iterationId = 1; repeated bytes keys = 2;}
+
+message SubsequentRequest {int64 iterationId = 1; int64 skipCount = 2; int64 takeCount = 3;}
+
+message GetRangeRequest {int64 transactionId = 1; int64 columnId = 2; repeated bytes startKeysInclusive = 3; repeated bytes endKeysExclusive = 4; bool reverse = 5; int64 timeoutMs = 6;}
+message FirstAndLast {optional KV first = 1; optional KV last = 2;}
+message EntriesCount {int64 count = 1;}
+
+service RocksDBService {
+  rpc openTransaction(OpenTransactionRequest) returns (OpenTransactionResponse);
+  rpc closeTransaction(CloseTransactionRequest) returns (CloseTransactionResponse);
+  rpc closeFailedUpdate(CloseFailedUpdateRequest) returns (google.protobuf.Empty);
+  rpc createColumn(CreateColumnRequest) returns (CreateColumnResponse);
+  rpc deleteColumn(DeleteColumnRequest) returns (google.protobuf.Empty);
+  rpc getColumnId(GetColumnIdRequest) returns (GetColumnIdResponse);
+  rpc put(PutRequest) returns (google.protobuf.Empty);
+  rpc putBatch(stream PutBatchRequest) returns (google.protobuf.Empty);
+  rpc putMulti(stream PutMultiRequest) returns (google.protobuf.Empty);
+  rpc putGetPrevious(PutRequest) returns (Previous);
+  rpc putMultiGetPrevious(stream PutMultiRequest) returns (stream Previous);
+  rpc putGetDelta(PutRequest) returns (Delta);
+  rpc putMultiGetDelta(stream PutMultiRequest) returns (stream Delta);
+  rpc putGetChanged(PutRequest) returns (Changed);
+  rpc putMultiGetChanged(stream PutMultiRequest) returns (stream Changed);
+  rpc putGetPreviousPresence(PutRequest) returns (PreviousPresence);
+  rpc putMultiGetPreviousPresence(stream PutMultiRequest) returns (stream PreviousPresence);
+  rpc get(GetRequest) returns (GetResponse);
+  rpc getForUpdate(GetRequest) returns (UpdateBegin);
+  rpc exists(GetRequest) returns (PreviousPresence);
+  rpc openIterator(OpenIteratorRequest) returns (OpenIteratorResponse);
+  rpc closeIterator(CloseIteratorRequest) returns (google.protobuf.Empty);
+  rpc seekTo(SeekToRequest) returns (google.protobuf.Empty);
+  rpc subsequent(SubsequentRequest) returns (google.protobuf.Empty);
+  rpc subsequentExists(SubsequentRequest) returns (PreviousPresence);
+  rpc subsequentMultiGet(SubsequentRequest) returns (stream KV);
+  rpc reduceRangeFirstAndLast(GetRangeRequest) returns (FirstAndLast);
+  rpc reduceRangeEntriesCount(GetRangeRequest) returns (EntriesCount);
+  rpc getAllInRange(GetRangeRequest) returns (stream KV);
+}
