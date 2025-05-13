@@ -60,7 +60,7 @@ def get_input_peer(peer):
 
 async def fetchone(client: rocksdb_pb2_grpc.RocksDBServiceStub, column: int, keys: Any) -> Optional[Dict]:
     """ Small helper - fetches a single row from provided query """
-    value = cast(rockserver_storage_pb2.GetResponse, await client.get(rockserver_storage_pb2.GetRequest(0, column, keys))).value
+    value = cast(rockserver_storage_pb2.GetResponse, await client.get(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=column, keys=keys))).value
     value = bson.loads(value) if value else None
     return dict(value) if value else None
 
@@ -155,12 +155,12 @@ class RockServerStorage(Storage):
     async def delete(self):
         """ Delete all the tables and indexes """
         await self.delete_data()
-        await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(self._session_col))
+        await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._session_col))
         await self.create_sessions_col()
 
     async def delete_data(self):
         """ Delete only data, keep session """
-        await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(self._peer_col))
+        await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._peer_col))
         await self.create_data_cols()
 
     # peer_id, access_hash, peer_type, phone_number
@@ -274,7 +274,7 @@ class RockServerStorage(Storage):
         self._session_data[column] = value  # update local copy
         failed = True
         while failed:
-            update_begin = cast(rockserver_storage_pb2.UpdateBegin, await self._client.getForUpdate(rockserver_storage_pb2.GetRequest(0, self._session_col, SESSION_KEY)))
+            update_begin = cast(rockserver_storage_pb2.UpdateBegin, await self._client.getForUpdate(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=self._session_col, keys=SESSION_KEY)))
             try:
                 decoded_bson_session_data = bson.loads(
                     update_begin.previous) if update_begin.previous is not None else None
@@ -284,13 +284,13 @@ class RockServerStorage(Storage):
                 else:
                     session_data = self._session_data
                 encoded_session_data = bson.dumps(session_data)
-                await self._client.put(rockserver_storage_pb2.PutRequest(update_begin.updateId, self._session_col, rockserver_storage_pb2.KV(SESSION_KEY, encoded_session_data)))
+                await self._client.put(rockserver_storage_pb2.PutRequest(columnId=update_begin.updateId, transactionOrUpdateId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
                 failed = False
             except Exception as e:
                 print("Failed to update session in rocksdb, cancelling the update transaction and retrying...", e)
                 failed = True
                 try:
-                    await self._client.closeFailedUpdate(rockserver_storage_pb2.CloseFailedUpdateRequest(update_begin.updateId))
+                    await self._client.closeFailedUpdate(rockserver_storage_pb2.CloseFailedUpdateRequest(updateId=update_begin.updateId))
                 except:
                     pass
             if failed:
