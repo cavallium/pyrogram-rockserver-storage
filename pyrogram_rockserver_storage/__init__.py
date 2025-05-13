@@ -190,7 +190,7 @@ class RockServerStorage(Storage):
             while failed:
                 try:
                     async def request_():
-                        initial_request = rockserver_storage_pb2.PutMultiInitialRequest(transactionOrUpdateId=0, columnId=self._peer_col)
+                        yield rockserver_storage_pb2.PutMultiRequest(initialRequest=rockserver_storage_pb2.PutMultiInitialRequest(transactionOrUpdateId=0, columnId=self._peer_col))
                         for deduplicated_peer in deduplicated_peers:
                             peer_id = deduplicated_peer[0]
                             phone_number = deduplicated_peer[3]
@@ -199,7 +199,7 @@ class RockServerStorage(Storage):
                             value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
                                                            phone_number, deduplicated_peer[4])
                             value = bson.dumps(value_tuple)
-                            yield rockserver_storage_pb2.PutMultiRequest(initialRequest=initial_request, data=rockserver_storage_pb2.KV(keys=keys, value=value))
+                            yield rockserver_storage_pb2.PutMultiRequest(data=rockserver_storage_pb2.KV(keys=keys, value=value))
 
                             if phone_number is not None:
                                 self._phone_to_id[phone_number] = peer_id
