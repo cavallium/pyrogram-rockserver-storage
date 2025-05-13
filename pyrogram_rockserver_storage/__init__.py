@@ -284,7 +284,7 @@ class RockServerStorage(Storage):
                 else:
                     session_data = self._session_data
                 encoded_session_data: bytes = bson.dumps(session_data)
-                await self._client.put(rockserver_storage_pb2.PutRequest(columnId=update_begin.updateId, transactionOrUpdateId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
+                await self._client.put(rockserver_storage_pb2.PutRequest(transactionOrUpdateId=update_begin.updateId, columnId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
                 failed = False
             except Exception as e:
                 print("Failed to update session in rocksdb, cancelling the update transaction and retrying...", e)
