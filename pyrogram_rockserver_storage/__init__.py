@@ -60,7 +60,17 @@ def get_input_peer(peer):
 
 async def fetchone(client: rocksdb_pb2_grpc.RocksDBServiceStub, column: int, keys: Any) -> Optional[Dict]:
     """ Small helper - fetches a single row from provided query """
-    value = cast(rockserver_storage_pb2.GetResponse, await client.get(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=column, keys=keys))).value
+    value = None
+    failed = True
+    while failed:
+        try:
+            value = cast(rockserver_storage_pb2.GetResponse, await client.get(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=column, keys=keys))).value
+            failed = False
+        except Exception as e:
+            print("Failed to fetch an element from rocksdb, retrying...", e)
+            failed = True
+        if failed:
+            await asyncio.sleep(1)
     value = bson.loads(value) if value else None
     return dict(value) if value else None
 
