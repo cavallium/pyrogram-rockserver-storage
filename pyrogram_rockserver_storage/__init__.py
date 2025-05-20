@@ -68,8 +68,10 @@ async def fetchone(client: rocksdb_pb2_grpc.RocksDBServiceStub, column: int, key
             value = cast(rockserver_storage_pb2.GetResponse, await client.get(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=column, keys=keys))).value
             failed = False
         except Exception as e:
-            print(f"Failed to fetch an element from rocksdb ({retries}), retrying...", e)
+            print(f"Failed to fetch an element from rocksdb ({retries} retries), retrying...", e)
             failed = True
+            if retries + 1 >= 4:
+                raise e
         if failed:
             await asyncio.sleep(1)
             retries += 1
@@ -222,6 +224,7 @@ class RockServerStorage(Storage):
         # construct insert query
         if deduplicated_peers:
             failed = True
+            retries = 0
             while failed:
                 try:
                     async def request_():
@@ -242,10 +245,13 @@ class RockServerStorage(Storage):
                     await self._client.putMulti(request_())
                     failed = False
                 except Exception as e:
-                    print("Failed to update peers in rocksdb, retrying...", e)
+                    print(f"Failed to update peers in rocksdb ({retries} retries), retrying...", e)
                     failed = True
+                    if retries + 1 >= 4:
+                        raise e
                 if failed:
                     await asyncio.sleep(1)
+                    retries += 1
 
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
         for t in usernames:
@@ -308,6 +314,7 @@ class RockServerStorage(Storage):
     async def _set(self, column, value: Any):
         self._session_data[column] = value  # update local copy
         failed = True
+        retries = 0
         while failed:
             update_begin = cast(rockserver_storage_pb2.UpdateBegin, await self._client.getForUpdate(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=self._session_col, keys=SESSION_KEY)))
             try:
@@ -322,14 +329,17 @@ class RockServerStorage(Storage):
                 await self._client.put(rockserver_storage_pb2.PutRequest(transactionOrUpdateId=update_begin.updateId, columnId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
                 failed = False
             except Exception as e:
-                print("Failed to update session in rocksdb, cancelling the update transaction and retrying...", e)
+                print(f"Failed to update session in rocksdb ({retries} retries), cancelling the update transaction and retrying...", e)
                 failed = True
                 try:
                     await self._client.closeFailedUpdate(rockserver_storage_pb2.CloseFailedUpdateRequest(updateId=update_begin.updateId))
                 except:
                     pass
+                if retries + 1 >= 4:
+                    raise e
             if failed:
                 await asyncio.sleep(1)
+                retries += 1
 
     async def _accessor(self, column, value: Any = object):
         return self._session_data[column] if value == object else await self._set(column, value)
