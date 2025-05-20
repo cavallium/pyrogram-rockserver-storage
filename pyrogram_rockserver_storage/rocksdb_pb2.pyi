@@ -217,6 +217,14 @@ class PutMultiRequest(_message.Message):
     data: KV
     def __init__(self, initialRequest: _Optional[_Union[PutMultiInitialRequest, _Mapping]] = ..., data: _Optional[_Union[KV, _Mapping]] = ...) -> None: ...
 
+class PutMultiListRequest(_message.Message):
+    __slots__ = ("initialRequest", "data")
+    INITIALREQUEST_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    initialRequest: PutMultiInitialRequest
+    data: _containers.RepeatedCompositeFieldContainer[KV]
+    def __init__(self, initialRequest: _Optional[_Union[PutMultiInitialRequest, _Mapping]] = ..., data: _Optional[_Iterable[_Union[KV, _Mapping]]] = ...) -> None: ...
+
 class GetRequest(_message.Message):
     __slots__ = ("transactionOrUpdateId", "columnId", "keys")
     TRANSACTIONORUPDATEID_FIELD_NUMBER: _ClassVar[int]

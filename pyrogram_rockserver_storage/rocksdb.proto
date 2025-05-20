@@ -82,6 +82,7 @@ message PutBatchRequest {oneof putBatchRequestType {PutBatchInitialRequest initi
 
 message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
 message PutMultiRequest {oneof putMultiRequestType {PutMultiInitialRequest initialRequest = 1;KV data = 2;}}
+message PutMultiListRequest {PutMultiInitialRequest initialRequest = 1; repeated KV data = 2;}
 
 message GetRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
 message GetResponse {optional bytes value = 1;}
@@ -109,6 +110,7 @@ service RocksDBService {
   rpc put(PutRequest) returns (google.protobuf.Empty);
   rpc putBatch(stream PutBatchRequest) returns (google.protobuf.Empty);
   rpc putMulti(stream PutMultiRequest) returns (google.protobuf.Empty);
+  rpc putMultiList(PutMultiListRequest) returns (google.protobuf.Empty);
   rpc putGetPrevious(PutRequest) returns (Previous);
   rpc putMultiGetPrevious(stream PutMultiRequest) returns (stream Previous);
   rpc putGetDelta(PutRequest) returns (Delta);

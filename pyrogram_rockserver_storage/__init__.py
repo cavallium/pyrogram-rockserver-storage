@@ -228,22 +228,22 @@ class RockServerStorage(Storage):
             retries = 0
             while failed:
                 try:
-                    async def request_():
-                        yield rockserver_storage_pb2.PutMultiRequest(initialRequest=rockserver_storage_pb2.PutMultiInitialRequest(transactionOrUpdateId=0, columnId=self._peer_col))
-                        for deduplicated_peer in deduplicated_peers:
-                            peer_id = deduplicated_peer[0]
-                            phone_number = deduplicated_peer[3]
+                    initial_request = rockserver_storage_pb2.PutMultiInitialRequest(transactionOrUpdateId=0, columnId=self._peer_col)
+                    kv_list = []
+                    for deduplicated_peer in deduplicated_peers:
+                        peer_id = deduplicated_peer[0]
+                        phone_number = deduplicated_peer[3]
 
-                            keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
-                            value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
-                                                           phone_number, deduplicated_peer[4])
-                            value: bytes = bson.dumps(value_tuple)
-                            yield rockserver_storage_pb2.PutMultiRequest(data=rockserver_storage_pb2.KV(keys=keys, value=value))
+                        keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+                        value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
+                                                       phone_number, deduplicated_peer[4])
+                        value = bson.dumps(value_tuple)
+                        kv_list.append(rockserver_storage_pb2.KV(keys=keys, value=value))
 
-                            if phone_number is not None:
-                                self._phone_to_id[phone_number] = peer_id
+                        if phone_number is not None:
+                            self._phone_to_id[phone_number] = peer_id
 
-                    await self._client.putMulti(request_())
+                    await self._client.putMultiList(rockserver_storage_pb2.PutMultiListRequest(initialRequest=initial_request, data=kv_list))
                     failed = False
                 except Exception as e:
                     print(f"Failed to update peers in rocksdb ({retries} retries), retrying...", e)

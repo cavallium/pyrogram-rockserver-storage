@@ -4,7 +4,7 @@ import grpc
 import warnings
 
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
-import pyrogram_rockserver_storage.rocksdb_pb2 as rocksdb__pb2
+import rocksdb_pb2 as rocksdb__pb2
 
 GRPC_GENERATED_VERSION = '1.72.0'
 GRPC_VERSION = grpc.__version__
@@ -78,6 +78,11 @@ class RocksDBServiceStub(object):
         self.putMulti = channel.stream_unary(
                 '/it.cavallium.rockserver.core.common.api.proto.RocksDBService/putMulti',
                 request_serializer=rocksdb__pb2.PutMultiRequest.SerializeToString,
+                response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+                _registered_method=True)
+        self.putMultiList = channel.unary_unary(
+                '/it.cavallium.rockserver.core.common.api.proto.RocksDBService/putMultiList',
+                request_serializer=rocksdb__pb2.PutMultiListRequest.SerializeToString,
                 response_deserializer=google_dot_protobuf_dot_empty__pb2.Empty.FromString,
                 _registered_method=True)
         self.putGetPrevious = channel.unary_unary(
@@ -234,6 +239,12 @@ class RocksDBServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def putMulti(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def putMultiList(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -405,6 +416,11 @@ def add_RocksDBServiceServicer_to_server(servicer, server):
             'putMulti': grpc.stream_unary_rpc_method_handler(
                     servicer.putMulti,
                     request_deserializer=rocksdb__pb2.PutMultiRequest.FromString,
+                    response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
+            ),
+            'putMultiList': grpc.unary_unary_rpc_method_handler(
+                    servicer.putMultiList,
+                    request_deserializer=rocksdb__pb2.PutMultiListRequest.FromString,
                     response_serializer=google_dot_protobuf_dot_empty__pb2.Empty.SerializeToString,
             ),
             'putGetPrevious': grpc.unary_unary_rpc_method_handler(
@@ -750,6 +766,33 @@ class RocksDBService(object):
             target,
             '/it.cavallium.rockserver.core.common.api.proto.RocksDBService/putMulti',
             rocksdb__pb2.PutMultiRequest.SerializeToString,
+            google_dot_protobuf_dot_empty__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def putMultiList(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/it.cavallium.rockserver.core.common.api.proto.RocksDBService/putMultiList',
+            rocksdb__pb2.PutMultiListRequest.SerializeToString,
             google_dot_protobuf_dot_empty__pb2.Empty.FromString,
             options,
             channel_credentials,
