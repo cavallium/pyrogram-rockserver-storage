@@ -2,6 +2,7 @@ __author__ = 'Andrea Cavalli'
 __version__ = '0.2'
 
 import asyncio
+import json
 import time
 import urllib
 import warnings
@@ -135,7 +136,7 @@ class RockServerStorage(Storage):
             ('grpc.initial_reconnect_backoff_ms', 1000),  # Start with 1s backoff
             ('grpc.max_reconnect_backoff_ms', 60000),  # Max backoff of 1 minute between attempts
             ("grpc.enable_retries", True),
-            ("grpc.service_config", {
+            ("grpc.service_config", json.dumps({
                 "retryPolicy": {
                     "maxAttempts": 10,
                     "initialBackoff": "1s",
@@ -146,7 +147,7 @@ class RockServerStorage(Storage):
                         "UNAVAILABLE"
                     ]
                 }
-            })
+            }))
         ]
         self._channel = grpc.aio.insecure_channel(target=f'{self._hostname}:{self._port}', compression=grpc.Compression.Gzip, options=channel_options)
         self._client = RocksDBServiceStub(self._channel)
