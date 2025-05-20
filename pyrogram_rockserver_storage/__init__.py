@@ -62,15 +62,17 @@ async def fetchone(client: rocksdb_pb2_grpc.RocksDBServiceStub, column: int, key
     """ Small helper - fetches a single row from provided query """
     value = None
     failed = True
+    retries = 0
     while failed:
         try:
             value = cast(rockserver_storage_pb2.GetResponse, await client.get(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=column, keys=keys))).value
             failed = False
         except Exception as e:
-            print("Failed to fetch an element from rocksdb, retrying...", e)
+            print(f"Failed to fetch an element from rocksdb ({retries}), retrying...", e)
             failed = True
         if failed:
             await asyncio.sleep(1)
+            retries += 1
     value = bson.loads(value) if value else None
     return dict(value) if value else None
 
@@ -121,7 +123,30 @@ class RockServerStorage(Storage):
 
     async def open(self):
         """ Initialize pyrogram session"""
-        self._channel = grpc.aio.insecure_channel(target=f'{self._hostname}:{self._port}', compression=grpc.Compression.Gzip)
+        channel_options = [
+            ('grpc.keepalive_time_ms', 10000),  # Send a ping every 10 seconds if no other activity
+            ('grpc.keepalive_timeout_ms', 5000),  # Wait 5 seconds for the ping ack before assuming failure
+            ('grpc.keepalive_permit_without_calls', True),  # Allow pings even if there are no active calls
+            ('grpc.http2.min_time_between_pings_ms', 10000),  # Minimum time between pings
+            ('grpc.http2.max_pings_without_data', 0),  # Allow pings even without data
+            ('grpc.http2.min_ping_interval_without_data_ms', 5000),  # How often to ping if no data, useful for http2
+            ('grpc.initial_reconnect_backoff_ms', 1000),  # Start with 1s backoff
+            ('grpc.max_reconnect_backoff_ms', 60000),  # Max backoff of 1 minute between attempts
+            ("grpc.enable_retries", True),
+            ("grpc.service_config", {
+                "retryPolicy": {
+                    "maxAttempts": 10,
+                    "initialBackoff": "1s",
+                    "maxBackoff": "10s",
+                    "backoffMultiplier": 2,
+                    "retryableStatusCodes": [
+                        "RESOURCE_EXHAUSTED",
+                        "UNAVAILABLE"
+                    ]
+                }
+            })
+        ]
+        self._channel = grpc.aio.insecure_channel(target=f'{self._hostname}:{self._port}', compression=grpc.Compression.Gzip, options=channel_options)
         self._client = RocksDBServiceStub(self._channel)
 
         # Column('dc_id', BIGINT, primary_key=True),
