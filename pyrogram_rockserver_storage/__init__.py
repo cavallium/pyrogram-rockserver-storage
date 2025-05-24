@@ -320,7 +320,7 @@ class RockServerStorage(Storage):
             update_begin = cast(rockserver_storage_pb2.UpdateBegin, await self._client.getForUpdate(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=self._session_col, keys=SESSION_KEY)))
             try:
                 decoded_bson_session_data = bson.loads(
-                    update_begin.previous) if update_begin.previous is not None else None
+                    update_begin.previous) if update_begin.previous else None
                 if decoded_bson_session_data is not None:
                     session_data = decoded_bson_session_data
                     session_data[column] = value
