@@ -26,8 +26,6 @@ from pyrogram_rockserver_storage.rocksdb_pb2_grpc import RocksDBServiceStub
 SESSION_KEY = [bytes([0])]
 DIGITS = set(digits)
 
-db_lock = asyncio.Lock()
-
 class PeerType(Enum):
     """ Pyrogram peer types """
     USER = 'user'
@@ -63,12 +61,13 @@ def get_input_peer(peer):
 
 async def fetchone(client: rocksdb_pb2_grpc.RocksDBServiceStub, column: int, keys: Any) -> Optional[Dict]:
     """ Small helper - fetches a single row from provided query """
-    value = None
+    value_bytes: bytes | None = None
     failed = True
     retries = 0
     while failed:
         try:
-            value = cast(rockserver_storage_pb2.GetResponse, await client.get(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=column, keys=keys))).value
+            response: rockserver_storage_pb2.GetResponse = await client.get(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=column, keys=keys))
+            value_bytes = response.value
             failed = False
         except Exception as e:
             print(f"Failed to fetch an element from rocksdb ({retries} retries), retrying...", e)
@@ -78,7 +77,7 @@ async def fetchone(client: rocksdb_pb2_grpc.RocksDBServiceStub, column: int, key
         if failed:
             await asyncio.sleep(1)
             retries += 1
-    value = bson.loads(value) if value else None
+    value = bson.loads(value_bytes) if value_bytes else None
     return dict(value) if value else None
 
 
@@ -183,16 +182,14 @@ class RockServerStorage(Storage):
 
     async def save(self):
         """ On save we update the date """
-        async with db_lock:
-            await self.date(int(time.time()))
+        await self.date(int(time.time()))
 
     async def close(self):
         """ Close transport """
-        async with db_lock:
-            if self._client is not None:
-                close_future = self._channel.close()
-                if close_future is not None:
-                    await close_future
+        if self._client is not None:
+            close_future = self._channel.close()
+            if close_future is not None:
+                await close_future
 
     async def delete(self):
         """ Delete all the tables and indexes """
@@ -208,119 +205,114 @@ class RockServerStorage(Storage):
     # peer_id, access_hash, peer_type, phone_number
     async def update_peers(self, peers: List[Tuple[int, int, str, str]]):
         """ Copied and adopted from pyro sqlite storage"""
-        async with db_lock:
-            if not peers:
-                return
+        if not peers:
+            return
 
-            now = int(time.time())
-            deduplicated_peers = []
-            seen_ids = set()
+        now = int(time.time())
+        deduplicated_peers = []
+        seen_ids = set()
 
-            # deduplicate peers to avoid possible `CardinalityViolation` error
-            for peer in peers:
-                if not self._save_user_peers and peer[2] == "user":
-                    continue
-                peer_id, *_ = peer
-                if peer_id in seen_ids:
-                    continue
-                seen_ids.add(peer_id)
-                # enrich peer with timestamp and append
-                deduplicated_peers.append(tuple(chain(peer, (now,))))
+        # deduplicate peers to avoid possible `CardinalityViolation` error
+        for peer in peers:
+            if not self._save_user_peers and peer[2] == "user":
+                continue
+            peer_id, *_ = peer
+            if peer_id in seen_ids:
+                continue
+            seen_ids.add(peer_id)
+            # enrich peer with timestamp and append
+            deduplicated_peers.append(tuple(chain(peer, (now,))))
 
-            # construct insert query
-            if deduplicated_peers:
-                failed = True
-                retries = 0
-                while failed:
-                    try:
-                        initial_request = rockserver_storage_pb2.PutMultiInitialRequest(transactionOrUpdateId=0, columnId=self._peer_col)
-                        kv_list = []
-                        for deduplicated_peer in deduplicated_peers:
-                            peer_id = deduplicated_peer[0]
-                            phone_number = deduplicated_peer[3]
+        # construct insert query
+        if deduplicated_peers:
+            failed = True
+            retries = 0
+            while failed:
+                try:
+                    initial_request = rockserver_storage_pb2.PutMultiInitialRequest(transactionOrUpdateId=0, columnId=self._peer_col)
+                    kv_list = []
+                    for deduplicated_peer in deduplicated_peers:
+                        peer_id = deduplicated_peer[0]
+                        phone_number = deduplicated_peer[3]
 
-                            keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
-                            value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
-                                                           phone_number, deduplicated_peer[4])
-                            value = bson.dumps(value_tuple)
+                        keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+                        value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
+                                                       phone_number, deduplicated_peer[4])
+                        value = bson.dumps(value_tuple)
+                        if value:
                             kv_list.append(rockserver_storage_pb2.KV(keys=keys, value=value))
 
-                            if phone_number is not None:
-                                self._phone_to_id[phone_number] = peer_id
+                        if phone_number is not None:
+                            self._phone_to_id[phone_number] = peer_id
 
-                        await self._client.putMultiList(rockserver_storage_pb2.PutMultiListRequest(initialRequest=initial_request, data=kv_list))
-                        failed = False
-                    except Exception as e:
-                        print(f"Failed to update peers in rocksdb ({retries} retries), retrying...", e)
-                        failed = True
-                        if retries + 1 >= 4:
-                            raise e
-                    if failed:
-                        await asyncio.sleep(1)
-                        retries += 1
+                    await self._client.putMultiList(rockserver_storage_pb2.PutMultiListRequest(initialRequest=initial_request, data=kv_list))
+                    failed = False
+                except Exception as e:
+                    print(f"Failed to update peers in rocksdb ({retries} retries), retrying...", e)
+                    failed = True
+                    if retries + 1 >= 4:
+                        raise e
+                if failed:
+                    await asyncio.sleep(1)
+                    retries += 1
 
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
-        async with db_lock:
-            for t in usernames:
-                peer_id = t[0]
-                id_usernames = t[1]
-                for username in id_usernames:
-                    self._username_to_id[username] = peer_id
+        for t in usernames:
+            peer_id = t[0]
+            id_usernames = t[1]
+            for username in id_usernames:
+                self._username_to_id[username] = peer_id
 
     async def update_state(self, value: Tuple[int, int, int, int, int] = object):
-        async with db_lock:
-            if value == object:
-                return sorted(self._update_to_state.values(), key=lambda x: x[3], reverse=False)
+        if value == object:
+            return sorted(self._update_to_state.values(), key=lambda x: x[3], reverse=False)
+        else:
+            if isinstance(value, int):
+                self._update_to_state.pop(value)
             else:
-                if isinstance(value, int):
-                    self._update_to_state.pop(value)
-                else:
-                    self._update_to_state[value[0]] = value
+                self._update_to_state[value[0]] = value
 
     async def get_peer_by_id(self, peer_id: int):
-        async with db_lock:
-            if isinstance(peer_id, str) or (not self._save_user_peers and peer_id > 0):
-                raise KeyError(f"ID not found: {peer_id}")
+        if isinstance(peer_id, str) or (not self._save_user_peers and peer_id > 0):
+            raise KeyError(f"ID not found: {peer_id}")
 
-            keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
-            encoded_value = await fetchone(self._client, self._peer_col, keys)
-            value_tuple = decode_peer_info(peer_id, encoded_value)
-            if value_tuple is None:
-                raise KeyError(f"ID not found: {peer_id}")
+        keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+        encoded_value = await fetchone(self._client, self._peer_col, keys)
+        value_tuple = decode_peer_info(peer_id, encoded_value)
+        if value_tuple is None:
+            raise KeyError(f"ID not found: {peer_id}")
 
-            return get_input_peer(value_tuple)
+        return get_input_peer(value_tuple)
 
     async def get_peer_by_username(self, username: str):
-        async with db_lock:
-            peer_id = self._username_to_id.get(username)
+        peer_id = self._username_to_id.get(username)
 
-            if peer_id is None:
-                raise KeyError(f"Username not found: {username}")
+        if peer_id is None:
+            raise KeyError(f"Username not found: {username}")
 
-            keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
-            encoded_value = await fetchone(self._client, self._peer_col, keys)
-            value_tuple = decode_peer_info(peer_id, encoded_value)
+        keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+        encoded_value = await fetchone(self._client, self._peer_col, keys)
+        value_tuple = decode_peer_info(peer_id, encoded_value)
 
-            if value_tuple is None:
-                raise KeyError(f"Username not found: {username}")
+        if value_tuple is None:
+            raise KeyError(f"Username not found: {username}")
 
-            if int(time.time() - value_tuple['last_update_on']) > self.USERNAME_TTL:
-                raise KeyError(f"Username expired: {username}")
+        if int(time.time() - value_tuple['last_update_on']) > self.USERNAME_TTL:
+            raise KeyError(f"Username expired: {username}")
 
-            return get_input_peer(value_tuple)
+        return get_input_peer(value_tuple)
 
     async def get_peer_by_phone_number(self, phone_number: str):
-        async with db_lock:
-            peer_id = self._phone_to_id.get(phone_number)
+        peer_id = self._phone_to_id.get(phone_number)
 
-            if peer_id is None:
-                raise KeyError(f"Phone number not found: {phone_number}")
+        if peer_id is None:
+            raise KeyError(f"Phone number not found: {phone_number}")
 
-            keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
-            encoded_value = await fetchone(self._client, self._peer_col, keys)
-            value_tuple = decode_peer_info(peer_id, encoded_value)
+        keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
+        encoded_value = await fetchone(self._client, self._peer_col, keys)
+        value_tuple = decode_peer_info(peer_id, encoded_value)
 
-            return get_input_peer(value_tuple)
+        return get_input_peer(value_tuple)
 
     async def _set(self, column, value: Any):
         self._session_data[column] = value  # update local copy
