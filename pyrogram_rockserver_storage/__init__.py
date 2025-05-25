@@ -239,8 +239,7 @@ class RockServerStorage(Storage):
                         value_tuple = encode_peer_info(deduplicated_peer[1], deduplicated_peer[2],
                                                        phone_number, deduplicated_peer[4])
                         value = bson.dumps(value_tuple)
-                        if value:
-                            kv_list.append(rockserver_storage_pb2.KV(keys=keys, value=value))
+                        kv_list.append(rockserver_storage_pb2.KV(keys=keys, value=value))
 
                         if phone_number is not None:
                             self._phone_to_id[phone_number] = peer_id
