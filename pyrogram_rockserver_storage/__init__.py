@@ -123,6 +123,8 @@ class RockServerStorage(Storage):
         self._update_to_state = LRU(100_000)
         self._phone_to_id = LRU(100_000)
 
+        self._session_lock = asyncio.Lock()
+
         super().__init__(name=self._session_id)
 
     async def open(self):
@@ -171,11 +173,13 @@ class RockServerStorage(Storage):
         # Column('last_update_on', BIGINT),
         await self.create_data_cols()
 
-        fetched_session_data = await fetchone(self._client, self._session_col, SESSION_KEY)
+        async with self._session_lock:
+            fetched_session_data = await fetchone(self._client, self._session_col, SESSION_KEY)
         self._session_data = fetched_session_data if fetched_session_data is not None else self._session_data
 
     async def create_sessions_col(self):
-        self._session_col = cast(rockserver_storage_pb2.CreateColumnResponse, await self._client.createColumn(rockserver_storage_pb2.CreateColumnRequest(name=f'pyrogram_session_{self._session_id}', schema=rockserver_storage_pb2.ColumnSchema(fixedKeys=[1], variableTailKeys=[], hasValue=True)))).columnId
+        async with self._session_lock:
+            self._session_col = cast(rockserver_storage_pb2.CreateColumnResponse, await self._client.createColumn(rockserver_storage_pb2.CreateColumnRequest(name=f'pyrogram_session_{self._session_id}', schema=rockserver_storage_pb2.ColumnSchema(fixedKeys=[1], variableTailKeys=[], hasValue=True)))).columnId
 
     async def create_data_cols(self):
         self._peer_col = cast(rockserver_storage_pb2.CreateColumnResponse, await self._client.createColumn(rockserver_storage_pb2.CreateColumnRequest(name=f'peers_{self._session_id}', schema=rockserver_storage_pb2.ColumnSchema(fixedKeys=[8], variableTailKeys=[], hasValue=True)))).columnId
@@ -194,7 +198,8 @@ class RockServerStorage(Storage):
     async def delete(self):
         """ Delete all the tables and indexes """
         await self.delete_data()
-        await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._session_col))
+        async with self._session_lock:
+            await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._session_col))
         await self.create_sessions_col()
 
     async def delete_data(self):
@@ -314,29 +319,21 @@ class RockServerStorage(Storage):
         return get_input_peer(value_tuple)
 
     async def _set(self, column, value: Any):
+        async with self._session_lock:
+            await self._set_no_lock(column, value)
+
+    async def _set_no_lock(self, column, value: Any):
         self._session_data[column] = value  # update local copy
         failed = True
         retries = 0
         while failed:
-            update_begin = cast(rockserver_storage_pb2.UpdateBegin, await self._client.getForUpdate(rockserver_storage_pb2.GetRequest(transactionOrUpdateId=0, columnId=self._session_col, keys=SESSION_KEY)))
             try:
-                decoded_bson_session_data = bson.loads(
-                    update_begin.previous) if update_begin.previous else None
-                if decoded_bson_session_data is not None:
-                    session_data = decoded_bson_session_data
-                    session_data[column] = value
-                else:
-                    session_data = self._session_data
-                encoded_session_data: bytes = bson.dumps(session_data)
-                await self._client.put(rockserver_storage_pb2.PutRequest(transactionOrUpdateId=update_begin.updateId, columnId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
+                encoded_session_data: bytes = bson.dumps(self._session_data)
+                await self._client.put(rockserver_storage_pb2.PutRequest(transactionOrUpdateId=0, columnId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
                 failed = False
             except Exception as e:
                 print(f"Failed to update session in rocksdb ({retries} retries), cancelling the update transaction and retrying...", e)
                 failed = True
-                try:
-                    await self._client.closeFailedUpdate(rockserver_storage_pb2.CloseFailedUpdateRequest(updateId=update_begin.updateId))
-                except:
-                    pass
                 if retries + 1 >= 4:
                     raise e
             if failed:
@@ -344,7 +341,8 @@ class RockServerStorage(Storage):
                 retries += 1
 
     async def _accessor(self, column, value: Any = object):
-        return self._session_data[column] if value == object else await self._set(column, value)
+        async with self._session_lock:
+            return self._session_data[column] if value == object else await self._set_no_lock(column, value)
 
     async def dc_id(self, value: int = object):
         return await self._accessor('dc_id', value)
