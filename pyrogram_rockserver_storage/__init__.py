@@ -8,7 +8,7 @@ import time
 from enum import Enum
 from itertools import chain
 from string import digits
-from typing import Any, List, Tuple, Dict, Optional, cast, Type
+from typing import Any, List, Tuple, Dict, Optional, cast, Type, Generic, Callable, Awaitable
 
 import grpc.aio
 from grpc import Channel
@@ -18,6 +18,7 @@ from pyrogram.storage import Storage
 from lru import LRU
 
 import bson
+from typing_extensions import TypeVar
 
 import pyrogram_rockserver_storage.rocksdb_pb2 as rockserver_storage_pb2
 from pyrogram_rockserver_storage.rocksdb_pb2_grpc import RocksDBServiceStub
@@ -79,20 +80,35 @@ async def fetchone(client, column: int, keys: Any) -> Optional[Dict]:
     value = bson.loads(value_bytes) if value_bytes else None
     return dict(value) if value else None
 
+# This TypeVar allows us to make the client generic.
+# It can be any class that has gRPC methods.
+StubType = TypeVar("StubType")
 
-class ResilientRpcClient:
+class ResilientRpcClient(Generic[StubType]):
     """
-    A thread-safe, resilient gRPC client wrapper that automatically
-    reconnects upon channel failure.
+    A high-performance, asyncio-safe, resilient gRPC client wrapper that
+    automatically reconnects and caches method wrappers for speed.
+
+    This client is generic and can wrap any gRPC stub class.
+
+    Usage:
+        client = ResilientRpcClient[YourStubClass](hostname, port, YourStubClass)
+        async with client:
+            response = await client.YourRpcMethod(request)
     """
+    _RECONNECTABLE_STATUS_CODES = {
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.INTERNAL,
+        grpc.StatusCode.CANCELLED,  # Can happen on channel shutdown
+    }
 
     def __init__(
             self,
             hostname: str,
             port: int,
-            stub_class: Type,  # The class of your gRPC stub, e.g., RocksDBServiceStub
+            stub_class: Type[StubType],
             channel_options: Optional[list] = None,
-            compression: Optional[grpc.Compression] = grpc.Compression.Gzip
+            compression: Optional[grpc.Compression] = grpc.Compression.Gzip,
     ):
         self._hostname = hostname
         self._port = port
@@ -101,92 +117,95 @@ class ResilientRpcClient:
         self._compression = compression
 
         self._channel: Optional[grpc.aio.Channel] = None
-        self._client: Optional[Any] = None  # Will hold the instance of stub_class
-        self._lock = asyncio.Lock()  # Use asyncio.Lock for async code
+        self._stub: Optional[StubType] = None
+        self._lock = asyncio.Lock()
 
-    async def connect_manually(self):
-        await self._connect()
+        # A counter to track connection state. This helps prevent multiple
+        # coroutines from reconnecting simultaneously.
+        self._connection_generation = 0
 
-    async def _connect(self):
-        """Establishes a new channel and client stub."""
+    async def _connect(self) -> None:
+        """
+        Establishes a new channel and client stub. This method is protected
+        by the asyncio Lock.
+        """
         logging.info(f"Connecting to gRPC server at {self._hostname}:{self._port}...")
-        try:
-            # Close the existing channel if it exists and is not already closed
-            if self._channel:
-                await self._channel.close()
-        except Exception as e:
-            logging.warning(f"Ignoring error while closing old channel: {e}")
+        if self._channel:
+            await self._channel.close()
 
         self._channel = grpc.aio.insecure_channel(
             target=f'{self._hostname}:{self._port}',
             compression=self._compression,
             options=self._channel_options
         )
-        self._client = self._stub_class(self._channel)
-        logging.info("Successfully connected.")
+        self._stub = self._stub_class(self._channel)
 
-    async def close(self):
+        # Mark the connection as new
+        self._connection_generation += 1
+        logging.info(f"Successfully connected. New connection generation: {self._connection_generation}")
+
+    async def close(self) -> None:
         """Gracefully closes the gRPC channel."""
         if self._channel:
             logging.info("Closing gRPC channel.")
             await self._channel.close()
             self._channel = None
-            self._client = None
+            self._stub = None
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> Callable[..., Awaitable[Any]]:
         """
-        Magic method to proxy method calls to the underlying gRPC client.
-        This is where the retry logic lives.
+        Magic method to proxy method calls to the underlying gRPC stub.
+        It creates and caches a resilient wrapper for each RPC method.
         """
-        # Get the actual RPC method from the underlying client (e.g., 'Get')
-        # This will raise AttributeError if the method doesn't exist, which is the correct behavior.
-        method = getattr(self._client, name)
 
-        async def wrapper(*args, **kwargs):
-            """The async wrapper that performs the call and reconnects on failure."""
+        async def rpc_method_wrapper(*args, **kwargs):
+            if not self._stub:
+                raise ConnectionError("Client is not connected. Use 'async with' context.")
+
+            initial_generation = self._connection_generation
+
+            # The method is fetched from the stub here.
+            # getattr is used as we don't know the method name in advance.
+            method_to_call = getattr(self._stub, name)
+
             try:
                 # First attempt
-                return await method(*args, **kwargs)
+                return await method_to_call(*args, **kwargs)
             except grpc.aio.AioRpcError as e:
-                # Check if the error is a channel connectivity issue
-                if e.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.INTERNAL):
-                    logging.warning(f"gRPC call failed with {e.code()}. Attempting to reconnect.")
-
-                    # Acquire a lock to ensure only one coroutine attempts to reconnect
-                    async with self._lock:
-                        # We must re-check the connection status inside the lock.
-                        # Another coroutine might have already fixed it while we were waiting.
-                        # A simple way to check is to try the call again. If it works, we're good.
-                        try:
-                            # Re-fetch the method from the potentially new client instance
-                            check_method = getattr(self._client, name)
-                            return await check_method(*args, **kwargs)
-                        except grpc.aio.AioRpcError:
-                            # If it fails again, we are the one who needs to reconnect.
-                            logging.info("Reconnection confirmed to be necessary.")
-                            await self._connect()
-
-                    # After reconnecting, retry the call one more time
-                    logging.info("Retrying gRPC call after reconnection.")
-                    # Re-fetch the method from the brand new client instance
-                    retry_method = getattr(self._client, name)
-                    return await retry_method(*args, **kwargs)
-                else:
-                    # It's a different gRPC error (e.g., NOT_FOUND, INVALID_ARGUMENT).
-                    # These are application-level errors and should not trigger a reconnect.
+                if e.code() not in self._RECONNECTABLE_STATUS_CODES:
+                    logging.error(f"gRPC call '{name}' failed with non-retriable status: {e.code()}")
                     raise e
 
-        return wrapper
+                logging.warning(f"gRPC call '{name}' failed with {e.code()}. Attempting to reconnect.")
 
-    async def __aenter__(self):
-        """Async context manager entry."""
-        await self._connect()
+                async with self._lock:
+                    # Check if another coroutine has already reconnected
+                    # while we were waiting for the lock.
+                    if self._connection_generation == initial_generation:
+                        await self._connect()
+                    else:
+                        logging.info("Reconnection was already handled by another task.")
+
+                # After reconnection, retry the call one more time.
+                logging.info(f"Retrying gRPC call '{name}' after reconnection.")
+                retry_method_to_call = getattr(self._stub, name)
+                return await retry_method_to_call(*args, **kwargs)
+
+        # Cache the created wrapper on the instance. The next time `client.Method`
+        # is called, this cached method will be used directly, skipping __getattr__.
+        setattr(self, name, rpc_method_wrapper)
+        return rpc_method_wrapper
+
+    async def __aenter__(self) -> "ResilientRpcClient[StubType]":
+        """Async context manager entry: connects the client."""
+        async with self._lock:
+            if not self._stub:
+                await self._connect()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Async context manager exit: closes the connection."""
         await self.close()
-
 
 class RockServerStorage(Storage):
     """
