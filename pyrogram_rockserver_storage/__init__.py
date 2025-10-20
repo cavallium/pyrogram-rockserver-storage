@@ -52,13 +52,21 @@ class ResilientRpcClient(Generic[StubType]):
             stub_class: Type[StubType],
             channel_options: Optional[list] = None,
             compression: Optional[grpc.Compression] = grpc.Compression.Gzip,
+            # New retry parameters
+            retry_attempts: int = 3,
+            initial_backoff_ms: int = 100,
+            max_backoff_ms: int = 5000,
     ):
         self._hostname = hostname
         self._port = port
         self._stub_class = stub_class
         self._channel_options = channel_options
         self._compression = compression
+        self._retry_attempts = retry_attempts
+        self._initial_backoff_ms = initial_backoff_ms
+        self._max_backoff_ms = max_backoff_ms
 
+        self._is_closing = False
         self._channel: Optional[grpc.aio.Channel] = None
         self._stub: Optional[StubType] = None
         self._lock = asyncio.Lock()
@@ -111,12 +119,13 @@ class ResilientRpcClient(Generic[StubType]):
 
         This method is idempotent.
         """
-        if not self.is_connected:
+        if self._is_closing or not self.is_connected:
             return
 
         # Use the lock to prevent a race condition where one task is closing
         # while another is trying to reconnect.
         async with self._lock:
+            self._is_closing = True # Signal intent to close
             if self._channel:
                 logging.info("Closing gRPC channel.")
                 await self._channel.close()
@@ -131,37 +140,81 @@ class ResilientRpcClient(Generic[StubType]):
         """
 
         async def rpc_method_wrapper(*args, **kwargs):
-            if not self.is_connected:
-                raise ConnectionError("Client is not connected. Call `await client.connect()` first.")
+            # This wrapper now contains the full retry and reconnect logic.
+            last_error: Optional[Exception] = None
+            current_backoff_ms = self._initial_backoff_ms
 
-            initial_generation = self._connection_generation
+            # Get the deadline from kwargs if it exists
+            original_timeout = kwargs.get("timeout")
+            deadline = time.monotonic() + original_timeout if original_timeout else None
 
-            # The method is fetched from the stub here.
-            # getattr is used as we don't know the method name in advance.
-            method_to_call = getattr(self._stub, name)
+            for attempt in range(self._retry_attempts):
+                if deadline:
+                    remaining_time = deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        raise grpc.aio.AioRpcError(grpc.StatusCode.DEADLINE_EXCEEDED, details="Deadline exceeded after retries")
+                    kwargs["timeout"] = remaining_time # Adjust timeout for this attempt
 
-            try:
-                # First attempt
-                return await method_to_call(*args, **kwargs)
-            except grpc.aio.AioRpcError as e:
-                if e.code() not in self._RECONNECTABLE_STATUS_CODES:
-                    logging.error(f"gRPC call '{name}' failed with non-retriable status: {e.code()}")
+                if not self.is_connected:
+                    try:
+                        # Ensure we are connected before attempting the call.
+                        # This also handles the case where the client was closed.
+                        await self.connect()
+                    except Exception as e:
+                        # If the connection itself fails, treat it like an RPC error for retry.
+                        last_error = e
+                        logging.warning(f"Connection attempt failed: {e}. Retrying after backoff...")
+                        await asyncio.sleep(current_backoff_ms / 1000.0)
+                        current_backoff_ms = min(self._max_backoff_ms, current_backoff_ms * 2) + random.randint(0, 50)
+                        continue  # Go to the next retry attempt
+
+                # We believe we are connected, so we get the current stub and generation.
+                if self._stub is None: # Should not happen if connect() succeeded
+                     raise ConnectionError("Fatal: Stub is None despite successful connection.")
+
+                initial_generation = self._connection_generation
+
+                # The method is fetched from the stub here.
+                # getattr is used as we don't know the method name in advance.
+                method_to_call = getattr(self._stub, name)
+
+                try:
+                    # Make the RPC call
+                    return await method_to_call(*args, **kwargs)
+                except grpc.aio.AioRpcError as e:
+                    if self._is_closing:
+                        logging.warning("Call failed during client shutdown, not retrying.")
+                        raise e # Re-raise the error immediately
+                    last_error = e
+                    if e.code() not in self._RECONNECTABLE_STATUS_CODES:
+                        logging.error(f"gRPC call '{name}' failed with non-retriable status: {e.code()}")
+                        raise e
+
+                    logging.warning(f"gRPC call '{name}' (attempt {attempt + 1}/{self._retry_attempts}) failed with {e.code()}.")
+
+                    # Use a lock to ensure only one task attempts reconnection
+                    async with self._lock:
+                        # Check if another coroutine has already reconnected
+                        # while we were waiting for the lock.
+                        if self._connection_generation == initial_generation:
+                            logging.info("This task will handle the reconnection.")
+                            await self._create_new_connection()
+                        else:
+                            logging.info("Reconnection was already handled by another task.")
+                except Exception as e:
+                    # Catch other unexpected errors and re-raise
+                    logging.error(f"An unexpected error occurred during RPC call '{name}': {e}")
                     raise e
 
-                logging.warning(f"gRPC call '{name}' failed with {e.code()}. Attempting to reconnect.")
+                # If we are here, a retriable error occurred. Wait before the next attempt.
+                if attempt < self._retry_attempts - 1:
+                    sleep_time_ms = current_backoff_ms + random.randint(0, 50) # Jitter
+                    logging.info(f"Retrying in {sleep_time_ms}ms...")
+                    await asyncio.sleep(sleep_time_ms / 1000.0)
+                    current_backoff_ms = min(self._max_backoff_ms, current_backoff_ms * 2)
 
-                async with self._lock:
-                    # Check if another coroutine has already reconnected
-                    # while we were waiting for the lock.
-                    if self._connection_generation == initial_generation:
-                        await self._create_new_connection()
-                    else:
-                        logging.info("Reconnection was already handled by another task.")
-
-                # After reconnection, retry the call one more time.
-                logging.info(f"Retrying gRPC call '{name}' after reconnection.")
-                retry_method_to_call = getattr(self._stub, name)
-                return await retry_method_to_call(*args, **kwargs)
+            # If the loop finishes without returning, all retries have failed.
+            raise ConnectionError(f"gRPC call '{name}' failed after {self._retry_attempts} attempts.") from last_error
 
         # Cache the created wrapper on the instance. The next time `client.Method`
         # is called, this cached method will be used directly, skipping __getattr__.
