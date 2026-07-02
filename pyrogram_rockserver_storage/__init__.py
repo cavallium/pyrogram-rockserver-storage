@@ -25,6 +25,19 @@ from pyrogram_rockserver_storage.rocksdb_pb2_grpc import RocksDBServiceStub
 
 SESSION_KEY = [bytes([0])]
 DIGITS = set(digits)
+TEST_DC_ADDRESSES = {
+    1: "149.154.175.10",
+    2: "149.154.167.40",
+    3: "149.154.175.117",
+}
+PROD_DC_ADDRESSES = {
+    1: "149.154.175.53",
+    2: "149.154.167.51",
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "91.108.56.130",
+    203: "91.105.192.100",
+}
 
 
 # This TypeVar allows us to make the client generic.
@@ -315,7 +328,18 @@ class RockServerStorage(Storage):
         self._session_col = None
         self._peer_col = None
         self._session_id = f'{session_unique_name}'
-        self._session_data = {"dc_id": 2, "api_id": None, "test_mode": None, "auth_key": None, "date": 0, "user_id": None, "is_bot": None, "phone": None}
+        self._session_data = {
+            "dc_id": 2,
+            "api_id": None,
+            "server_address": None,
+            "port": None,
+            "test_mode": None,
+            "auth_key": None,
+            "date": 0,
+            "user_id": None,
+            "is_bot": None,
+            "phone": None,
+        }
         self._channel: Channel | None = None
         self._client: ResilientRpcClient[RocksDBServiceStub] | None = None
         self._hostname = hostname
@@ -379,7 +403,29 @@ class RockServerStorage(Storage):
 
         async with self._session_lock:
             fetched_session_data = await fetchone(self._client, self._session_col, SESSION_KEY)
-        self._session_data = fetched_session_data if fetched_session_data is not None else self._session_data
+            if fetched_session_data is not None:
+                self._session_data.update(fetched_session_data)
+            await self._migrate_session_endpoint_no_lock()
+
+    async def _migrate_session_endpoint_no_lock(self):
+        if self._session_data.get("test_mode") is None:
+            return
+
+        changed = False
+        test_mode = bool(self._session_data["test_mode"])
+        dc_id = self._session_data.get("dc_id") or 2
+
+        if self._session_data.get("server_address") is None:
+            dc_addresses = TEST_DC_ADDRESSES if test_mode else PROD_DC_ADDRESSES
+            self._session_data["server_address"] = dc_addresses[dc_id]
+            changed = True
+
+        if self._session_data.get("port") is None:
+            self._session_data["port"] = 80 if test_mode else 443
+            changed = True
+
+        if changed:
+            await self._save_session_data_no_lock()
 
     async def create_sessions_col(self):
         async with self._session_lock:
@@ -528,6 +574,9 @@ class RockServerStorage(Storage):
 
     async def _set_no_lock(self, column, value: Any):
         self._session_data[column] = value  # update local copy
+        await self._save_session_data_no_lock()
+
+    async def _save_session_data_no_lock(self):
         failed = True
         retries = 0
         while failed:
@@ -553,6 +602,12 @@ class RockServerStorage(Storage):
 
     async def api_id(self, value: int = object):
         return await self._accessor('api_id', value)
+
+    async def server_address(self, value: str = object):
+        return await self._accessor('server_address', value)
+
+    async def port(self, value: int = object):
+        return await self._accessor('port', value)
 
     async def test_mode(self, value: bool = object):
         return await self._accessor('test_mode', value)
