@@ -250,13 +250,23 @@ class PeerType(Enum):
     BOT = 'bot'
     GROUP = 'group'
     CHANNEL = 'channel'
+    DIRECT = 'direct'
+    FORUM = 'forum'
     SUPERGROUP = 'supergroup'
 
 def encode_peer_info(access_hash: int, peer_type: str, phone_number: str, last_update_on: int):
     return {"access_hash": access_hash, "peer_type": peer_type, "phone_number": phone_number, "last_update_on": last_update_on}
 
 def decode_peer_info(peer_id: int, value):
-    return {"id": peer_id, "access_hash": value["access_hash"], "peer_type": value["peer_type"], "phone_number": ["phone_number"], "last_update_on": value["last_update_on"]} if value is not None else None
+    if value is None:
+        return None
+    return {
+        "id": peer_id,
+        "access_hash": value["access_hash"],
+        "peer_type": value.get("peer_type", value.get("type")),
+        "phone_number": value.get("phone_number"),
+        "last_update_on": value["last_update_on"],
+    }
 
 def get_input_peer(peer):
     """ This function is almost blindly copied from pyrogram sqlite storage"""
@@ -268,13 +278,13 @@ def get_input_peer(peer):
     if peer_type == PeerType.GROUP.value:
         return raw.types.InputPeerChat(chat_id=-peer_id)
 
-    if peer_type in {PeerType.CHANNEL.value, PeerType.SUPERGROUP.value}:
+    if peer_type in {PeerType.DIRECT.value, PeerType.CHANNEL.value, PeerType.FORUM.value, PeerType.SUPERGROUP.value}:
         return raw.types.InputPeerChannel(
             channel_id=utils.get_channel_id(peer_id),
             access_hash=access_hash
         )
 
-    raise ValueError(f"Invalid peer type: {peer['type']}")
+    raise ValueError(f"Invalid peer type: {peer_type}")
 
 
 async def fetchone(client: ResilientRpcClient[RocksDBServiceStub], column: int, keys: Any) -> Optional[Dict]:
