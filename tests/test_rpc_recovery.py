@@ -29,6 +29,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.entered = asyncio.Event()
         self.release = threading.Event()
         self.executors = []
+        self.requests = []
 
     async def asyncTearDown(self):
         self.release.set()
@@ -43,6 +44,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def server(self, port=0):
         loop = asyncio.get_running_loop()
         def call(request, context):
+            self.requests.append(request)
             if request == b'fail':
                 context.abort(grpc.StatusCode.UNAVAILABLE, 'injected failure')
             if request == b'hold':
@@ -220,3 +222,16 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(counts['retry_wait_seconds'], 0)
         self.assertGreaterEqual(counts['call_seconds'], counts['retry_wait_seconds'])
         self.assertEqual(counts.get('ready_attempts', 0) + counts.get('not_ready_attempts', 0), 1)
+
+    async def test_readiness_probe_failure_cannot_fail_rpc(self):
+        from unittest.mock import patch
+        for observer in (None, lambda event, value: None):
+            with self.subTest(observed=observer is not None):
+                _, port = await self.server()
+                client = self.client(port, observer=observer)
+                await client.connect()
+                before = len(self.requests)
+                with patch.object(client._channel, "get_state", side_effect=RuntimeError("probe failed")) as probe:
+                    self.assertEqual(await client.call(b"ok"), b"ok")
+                    self.assertEqual(probe.call_count, 0 if observer is None else 1)
+                    self.assertEqual(len(self.requests) - before, 1)

@@ -93,6 +93,16 @@ class ResilientRpcClient(Generic[StubType]):
             except (Exception, asyncio.CancelledError):
                 pass
 
+    def _observe_readiness(self) -> None:
+        # Sampling is telemetry too: neither an unavailable probe nor an
+        # observer failure may prevent the actual RPC. Avoid the probe entirely
+        # when telemetry is disabled.
+        if self._observer is not None:
+            try:
+                self._observe("ready_attempts" if self.is_connected else "not_ready_attempts")
+            except (Exception, asyncio.CancelledError):
+                pass
+
     @property
     def is_connected(self) -> bool:
         """Whether the transport is currently ready, not merely allocated."""
@@ -156,7 +166,7 @@ class ResilientRpcClient(Generic[StubType]):
                     if remaining <= 0:
                         raise self._deadline_error()
                     self._observe("attempts")
-                    self._observe("ready_attempts" if self.is_connected else "not_ready_attempts")
+                    self._observe_readiness()
                     try:
                         return await getattr(self._stub, name)(
                             *args, timeout=remaining,
