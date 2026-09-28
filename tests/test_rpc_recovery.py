@@ -1,5 +1,7 @@
 import asyncio
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import grpc
 from google.protobuf.wrappers_pb2 import BytesValue
@@ -25,27 +27,36 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.servers = []
         self.clients = []
         self.entered = asyncio.Event()
-        self.release = asyncio.Event()
+        self.release = threading.Event()
+        self.executors = []
 
     async def asyncTearDown(self):
+        self.release.set()
         for client in self.clients:
             await client.close()
         for server in self.servers:
-            await server.stop(0)
+            server.stop(0).wait()
+
+        for executor in self.executors:
+            executor.shutdown(wait=True)
 
     async def server(self, port=0):
-        async def call(request, context):
+        loop = asyncio.get_running_loop()
+        def call(request, context):
             if request == b'fail':
-                await context.abort(grpc.StatusCode.UNAVAILABLE, 'injected failure')
+                context.abort(grpc.StatusCode.UNAVAILABLE, 'injected failure')
             if request == b'hold':
-                self.entered.set()
-                await self.release.wait()
+                loop.call_soon_threadsafe(self.entered.set)
+                while context.is_active() and not self.release.wait(0.01):
+                    pass
             return request
-        server = grpc.aio.server()
+        executor = ThreadPoolExecutor(max_workers=8)
+        self.executors.append(executor)
+        server = grpc.server(executor)
         server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
             'test.Service', {'call': grpc.unary_unary_rpc_method_handler(call, request_deserializer=decode, response_serializer=encode)}),))
         port = server.add_insecure_port(f'127.0.0.1:{port}')
-        await server.start()
+        server.start()
         self.servers.append(server)
         return server, port
 
@@ -79,7 +90,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         client = self.client(port, rpc_timeout=3)
         self.assertEqual(await client.call(b'before'), b'before')
         channel = client._channel
-        await server.stop(0)
+        server.stop(0).wait()
         pending = asyncio.create_task(client.call(b'after'))
         await asyncio.sleep(0.1)
         await self.server(port)
@@ -118,3 +129,39 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(grpc.aio.AioRpcError) as error:
             await client.call(b'hold', timeout=0)
         self.assertEqual(error.exception.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
+
+    async def test_default_deadline_includes_connection_lock(self):
+        _, port = await self.server()
+        client = self.client(port, rpc_timeout=0.05)
+        async with client._lock:
+            with self.assertRaises(grpc.aio.AioRpcError) as error:
+                await asyncio.wait_for(client.call(b'blocked'), 0.5)
+        self.assertEqual(error.exception.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
+        self.assertIsNone(client._channel)
+        self.assertEqual(await client.call(b'recovered'), b'recovered')
+
+    async def test_close_cancels_inflight_call_without_reopening(self):
+        _, port = await self.server()
+        client = self.client(port)
+        pending = asyncio.create_task(client.call(b'hold'))
+        await asyncio.wait_for(self.entered.wait(), 2)
+        await client.close()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, 0.5)
+        with self.assertRaises(ConnectionError):
+            await client.call(b'closed')
+        self.assertIsNone(client._channel)
+
+    async def test_nonfinite_defaults_are_rejected(self):
+        for timeout in (float('nan'), float('inf'), -float('inf')):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(ValueError):
+                    self.client(1, rpc_timeout=timeout)
+
+    async def test_nonfinite_explicit_deadlines_are_rejected(self):
+        client = self.client(1)
+        for timeout in (float('nan'), float('inf'), -float('inf')):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(ValueError):
+                    await client.call(b'invalid', timeout=timeout)
+        self.assertIsNone(client._channel)

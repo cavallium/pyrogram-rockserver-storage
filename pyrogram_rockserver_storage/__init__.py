@@ -4,6 +4,7 @@ __version__ = '0.2'
 import asyncio
 import json
 import logging
+import math
 import random
 import time
 from enum import Enum
@@ -62,8 +63,8 @@ class ResilientRpcClient(Generic[StubType]):
                  compression: Optional[grpc.Compression] = grpc.Compression.Gzip,
                  retry_attempts: int = 3, initial_backoff_ms: int = 100,
                  max_backoff_ms: int = 5000, rpc_timeout: float = 30.0):
-        if retry_attempts < 1 or rpc_timeout <= 0:
-            raise ValueError("retry_attempts and rpc_timeout must be positive")
+        if retry_attempts < 1 or not math.isfinite(rpc_timeout) or rpc_timeout <= 0:
+            raise ValueError("retry_attempts must be positive and rpc_timeout finite and positive")
         self._hostname = hostname
         self._port = port
         self._stub_class = stub_class
@@ -118,6 +119,8 @@ class ResilientRpcClient(Generic[StubType]):
         async def rpc_method_wrapper(*args, **kwargs):
             timeout = kwargs.pop("timeout", None)
             timeout = self._rpc_timeout if timeout is None else timeout
+            if not math.isfinite(timeout):
+                raise ValueError("timeout must be finite")
             if timeout <= 0:
                 raise self._deadline_error()
             deadline = time.monotonic() + timeout
