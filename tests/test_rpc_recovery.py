@@ -165,3 +165,58 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await client.call(b'invalid', timeout=timeout)
         self.assertIsNone(client._channel)
+
+    async def test_observer_failures_cannot_change_rpc_or_close(self):
+        for raised in (RuntimeError, asyncio.CancelledError):
+            with self.subTest(observer_failure=raised):
+                _, port = await self.server()
+                events = []
+                def observe(event, value):
+                    events.append((event, value))
+                    raise raised()
+                client = self.client(port, observer=observe)
+                self.assertEqual(await client.call(b'ok'), b'ok')
+                with self.assertRaises(grpc.aio.AioRpcError) as failure:
+                    await client.call(b'fail')
+                self.assertEqual(failure.exception.code(), grpc.StatusCode.UNAVAILABLE)
+                self.entered.clear()
+                held = asyncio.create_task(client.call(b'hold'))
+                await asyncio.wait_for(self.entered.wait(), 2)
+                held.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await held
+                await client.close()
+                self.assertIsNone(client._channel)
+                with self.assertRaises(ConnectionError):
+                    await client.call(b'closed')
+                counts = {event: sum(value for name, value in events if name == event)
+                          for event, _ in events}
+                self.assertEqual(counts['calls'], 4)
+                self.assertEqual(counts['attempts'], 5)
+                self.assertEqual(counts['retries'], 2)
+                self.assertEqual(counts['successes'], 1)
+                self.assertEqual(counts['failures'], 2)
+                self.assertEqual(counts['cancellations'], 1)
+                self.assertEqual(counts['active_delta'], 0)
+                self.assertEqual(counts['channels_created'], 1)
+                self.assertEqual(counts['channels_closed'], 1)
+
+    async def test_metrics_partition_deadline_and_measure_wait_without_extra_rpc(self):
+        _, port = await self.server()
+        events = []
+        client = self.client(port, observer=lambda event, value: events.append((event, value)))
+        client._initial_backoff_ms = 1000
+        with self.assertRaises(grpc.aio.AioRpcError) as failure:
+            await client.call(b'fail', timeout=0.1)
+        self.assertEqual(failure.exception.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
+        counts = {event: sum(value for name, value in events if name == event)
+                  for event, _ in events}
+        self.assertEqual(counts['calls'], 1)
+        self.assertEqual(counts['attempts'], 1)
+        self.assertEqual(counts['retries'], 1)
+        self.assertEqual(counts['deadlines'], 1)
+        self.assertNotIn('failures', counts)
+        self.assertEqual(counts['active_delta'], 0)
+        self.assertGreater(counts['retry_wait_seconds'], 0)
+        self.assertGreaterEqual(counts['call_seconds'], counts['retry_wait_seconds'])
+        self.assertEqual(counts.get('ready_attempts', 0) + counts.get('not_ready_attempts', 0), 1)

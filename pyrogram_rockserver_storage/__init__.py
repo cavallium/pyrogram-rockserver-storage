@@ -62,9 +62,11 @@ class ResilientRpcClient(Generic[StubType]):
                  channel_options: Optional[list] = None,
                  compression: Optional[grpc.Compression] = grpc.Compression.Gzip,
                  retry_attempts: int = 3, initial_backoff_ms: int = 100,
-                 max_backoff_ms: int = 5000, rpc_timeout: float = 30.0):
+                 max_backoff_ms: int = 5000, rpc_timeout: float = 30.0,
+                 observer: Optional[Callable[[str, float], None]] = None):
         if retry_attempts < 1 or not math.isfinite(rpc_timeout) or rpc_timeout <= 0:
             raise ValueError("retry_attempts must be positive and rpc_timeout finite and positive")
+        self._observer = observer
         self._hostname = hostname
         self._port = port
         self._stub_class = stub_class
@@ -78,6 +80,18 @@ class ResilientRpcClient(Generic[StubType]):
         self._channel: Optional[grpc.aio.Channel] = None
         self._stub: Optional[StubType] = None
         self._lock = asyncio.Lock()
+
+    def _observe(self, event: str, value: float = 1.0) -> None:
+        """Optional local counter hook. Must not perform I/O or block.
+
+        Observer failures cannot change RPC results or cancellation. The hook
+        receives only fixed event names and numbers, never request information.
+        """
+        if self._observer is not None:
+            try:
+                self._observer(event, value)
+            except (Exception, asyncio.CancelledError):
+                pass
 
     @property
     def is_connected(self) -> bool:
@@ -95,6 +109,7 @@ class ResilientRpcClient(Generic[StubType]):
                     target=f'{self._hostname}:{self._port}',
                     compression=self._compression, options=self._channel_options)
                 self._stub = self._stub_class(self._channel)
+                self._observe("channels_created")
                 logging.info("Created gRPC channel for %s:%s", self._hostname, self._port)
 
     async def close(self) -> None:
@@ -105,6 +120,7 @@ class ResilientRpcClient(Generic[StubType]):
             self._stub = None
             if channel is not None:
                 await channel.close()
+                self._observe("channels_closed")
 
     @staticmethod
     def _deadline_error():
@@ -116,7 +132,7 @@ class ResilientRpcClient(Generic[StubType]):
         if name.startswith('_'):
             raise AttributeError(name)
 
-        async def rpc_method_wrapper(*args, **kwargs):
+        async def invoke_with_deadline(*args, **kwargs):
             timeout = kwargs.pop("timeout", None)
             timeout = self._rpc_timeout if timeout is None else timeout
             if not math.isfinite(timeout):
@@ -126,7 +142,12 @@ class ResilientRpcClient(Generic[StubType]):
             deadline = time.monotonic() + timeout
 
             async def invoke():
-                await self.connect()
+                connect_started = time.monotonic()
+                try:
+                    await self.connect()
+                finally:
+                    # Allocation/lock wait, not gRPC transport readiness latency.
+                    self._observe("connect_wait_seconds", time.monotonic() - connect_started)
                 backoff = self._initial_backoff_ms
                 for attempt in range(self._retry_attempts):
                     if self._is_closing:
@@ -134,6 +155,8 @@ class ResilientRpcClient(Generic[StubType]):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise self._deadline_error()
+                    self._observe("attempts")
+                    self._observe("ready_attempts" if self.is_connected else "not_ready_attempts")
                     try:
                         return await getattr(self._stub, name)(
                             *args, timeout=remaining,
@@ -145,7 +168,12 @@ class ResilientRpcClient(Generic[StubType]):
                             raise
                         logging.warning("gRPC call %s failed with %s; retrying",
                                         name, error.code())
-                    await asyncio.sleep((backoff + random.randint(0, 50)) / 1000)
+                    self._observe("retries")
+                    retry_started = time.monotonic()
+                    try:
+                        await asyncio.sleep((backoff + random.randint(0, 50)) / 1000)
+                    finally:
+                        self._observe("retry_wait_seconds", time.monotonic() - retry_started)
                     backoff = min(self._max_backoff_ms, backoff * 2)
 
             # The budget also covers connection lock acquisition and retry sleeps.
@@ -153,6 +181,28 @@ class ResilientRpcClient(Generic[StubType]):
                 return await asyncio.wait_for(invoke(), timeout)
             except asyncio.TimeoutError as error:
                 raise self._deadline_error() from error
+
+        async def rpc_method_wrapper(*args, **kwargs):
+            started = time.monotonic()
+            self._observe("calls")
+            self._observe("active_delta", 1.0)
+            try:
+                result = await invoke_with_deadline(*args, **kwargs)
+            except asyncio.CancelledError:
+                self._observe("cancellations")
+                raise
+            except Exception as error:
+                if isinstance(error, grpc.aio.AioRpcError) and error.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                    self._observe("deadlines")
+                else:
+                    self._observe("failures")
+                raise
+            else:
+                self._observe("successes")
+                return result
+            finally:
+                self._observe("call_seconds", time.monotonic() - started)
+                self._observe("active_delta", -1.0)
 
         setattr(self, name, rpc_method_wrapper)
         return rpc_method_wrapper
@@ -250,12 +300,14 @@ class RockServerStorage(Storage):
                  hostname: str,
                  port: int,
                  session_unique_name: str,
-                 save_user_peers: bool):
+                 save_user_peers: bool,
+                 rpc_observer: Optional[Callable[[str, float], None]] = None):
         """
         :param hostname: rocksdb hostname
         :param port: rocksdb port
         :param session_unique_name: telegram session phone
         """
+        self._rpc_observer = rpc_observer
         self._session_col = None
         self._peer_col = None
         self._session_id = f'{session_unique_name}'
@@ -311,7 +363,7 @@ class RockServerStorage(Storage):
                 }
             }))
         ]
-        self._client = ResilientRpcClient(hostname=self._hostname, port=self._port, compression=grpc.Compression.Gzip, stub_class=RocksDBServiceStub, channel_options=channel_options)
+        self._client = ResilientRpcClient(hostname=self._hostname, port=self._port, compression=grpc.Compression.Gzip, stub_class=RocksDBServiceStub, channel_options=channel_options, observer=self._rpc_observer)
         await self._client.connect()
 
         # Column('dc_id', BIGINT, primary_key=True),
