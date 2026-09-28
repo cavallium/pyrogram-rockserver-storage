@@ -1,0 +1,120 @@
+import asyncio
+import unittest
+
+import grpc
+from google.protobuf.wrappers_pb2 import BytesValue
+
+
+def encode(value):
+    return BytesValue(value=value).SerializeToString()
+
+
+def decode(value):
+    return BytesValue.FromString(value).value
+
+from pyrogram_rockserver_storage import ResilientRpcClient
+
+
+class Stub:
+    def __init__(self, channel):
+        self.call = channel.unary_unary('/test.Service/call', request_serializer=encode, response_deserializer=decode)
+
+
+class RecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.servers = []
+        self.clients = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def asyncTearDown(self):
+        for client in self.clients:
+            await client.close()
+        for server in self.servers:
+            await server.stop(0)
+
+    async def server(self, port=0):
+        async def call(request, context):
+            if request == b'fail':
+                await context.abort(grpc.StatusCode.UNAVAILABLE, 'injected failure')
+            if request == b'hold':
+                self.entered.set()
+                await self.release.wait()
+            return request
+        server = grpc.aio.server()
+        server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
+            'test.Service', {'call': grpc.unary_unary_rpc_method_handler(call, request_deserializer=decode, response_serializer=encode)}),))
+        port = server.add_insecure_port(f'127.0.0.1:{port}')
+        await server.start()
+        self.servers.append(server)
+        return server, port
+
+    def client(self, port, **kwargs):
+        client = ResilientRpcClient('127.0.0.1', port, Stub,
+                                    initial_backoff_ms=1, **kwargs)
+        self.clients.append(client)
+        return client
+
+    async def test_failure_does_not_cancel_concurrent_rpc(self):
+        _, port = await self.server()
+        client = self.client(port)
+        held = asyncio.create_task(client.call(b'hold'))
+        await asyncio.wait_for(self.entered.wait(), 2)
+        with self.assertRaises((grpc.aio.AioRpcError, ConnectionError)):
+            await client.call(b'fail')
+        self.assertFalse(held.done())
+        self.release.set()
+        self.assertEqual(await held, b'hold')
+
+    async def test_default_deadline_bounds_unresponsive_server(self):
+        _, port = await self.server()
+        client = self.client(port, rpc_timeout=0.1)
+        with self.assertRaises(grpc.aio.AioRpcError) as error:
+            await asyncio.wait_for(client.call(b'hold'), 1)
+        self.assertEqual(error.exception.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
+        self.assertEqual(await client.call(b'ok'), b'ok')
+
+    async def test_channel_recovers_after_real_server_outage(self):
+        server, port = await self.server()
+        client = self.client(port, rpc_timeout=3)
+        self.assertEqual(await client.call(b'before'), b'before')
+        channel = client._channel
+        await server.stop(0)
+        pending = asyncio.create_task(client.call(b'after'))
+        await asyncio.sleep(0.1)
+        await self.server(port)
+        self.assertEqual(await pending, b'after')
+        self.assertIs(client._channel, channel)
+
+    async def test_close_cannot_resurrect_transport(self):
+        _, port = await self.server()
+        client = self.client(port)
+        await client.close()
+        with self.assertRaises(ConnectionError):
+            await client.call(b'after-close')
+        self.assertIsNone(client._channel)
+
+    async def test_caller_cancellation_is_not_retried(self):
+        _, port = await self.server()
+        client = self.client(port)
+        pending = asyncio.create_task(client.call(b'hold'))
+        await asyncio.wait_for(self.entered.wait(), 2)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertEqual(await client.call(b'healthy'), b'healthy')
+
+    async def test_deadline_includes_retry_sleep(self):
+        _, port = await self.server()
+        client = self.client(port)
+        client._initial_backoff_ms = 1000
+        with self.assertRaises(grpc.aio.AioRpcError) as error:
+            await asyncio.wait_for(client.call(b'fail', timeout=0.1), 0.5)
+        self.assertEqual(error.exception.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
+
+    async def test_zero_deadline_is_not_unbounded(self):
+        _, port = await self.server()
+        client = self.client(port)
+        with self.assertRaises(grpc.aio.AioRpcError) as error:
+            await client.call(b'hold', timeout=0)
+        self.assertEqual(error.exception.code(), grpc.StatusCode.DEADLINE_EXCEEDED)
