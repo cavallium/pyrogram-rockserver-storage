@@ -1,5 +1,5 @@
 __author__ = 'Andrea Cavalli'
-__version__ = '0.3'
+__version__ = '0.4'
 
 import asyncio
 import json
@@ -52,6 +52,14 @@ class ResilientRpcClient(Generic[StubType]):
     gRPC reconnects the channel itself. Replacing it after one failed RPC
     cancels unrelated calls, which can kill their caller's background tasks.
     """
+    _CONTEXT_PROFILES = {
+        "createColumn": (rockserver_storage_pb2.CreateColumnRequest, rockserver_storage_pb2.BATCH),
+        "deleteColumn": (rockserver_storage_pb2.DeleteColumnRequest, rockserver_storage_pb2.BATCH),
+        "get": (rockserver_storage_pb2.GetRequest, rockserver_storage_pb2.LATENCY),
+        "put": (rockserver_storage_pb2.PutRequest, rockserver_storage_pb2.INGEST),
+        "putMultiList": (rockserver_storage_pb2.PutMultiListRequest, rockserver_storage_pb2.INGEST),
+    }
+
     _RECONNECTABLE_STATUS_CODES = {
         grpc.StatusCode.UNAVAILABLE,
         grpc.StatusCode.INTERNAL,
@@ -150,6 +158,20 @@ class ResilientRpcClient(Generic[StubType]):
             if timeout <= 0:
                 raise self._deadline_error()
             deadline = time.monotonic() + timeout
+            request_context = None
+            context_spec = self._CONTEXT_PROFILES.get(name)
+            request = args[0] if args else kwargs.get("request")
+            if context_spec is not None and isinstance(request, context_spec[0]):
+                copied_request = type(request)()
+                copied_request.CopyFrom(request)
+                request_context = (copied_request.initialRequest.context if name == "putMultiList"
+                                   else copied_request.context)
+                request_context.profile = context_spec[1]
+                request_context.workloadContractVersion = 3
+                if args:
+                    args = (copied_request, *args[1:])
+                else:
+                    kwargs["request"] = copied_request
 
             async def invoke():
                 connect_started = time.monotonic()
@@ -165,6 +187,10 @@ class ResilientRpcClient(Generic[StubType]):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise self._deadline_error()
+                    if request_context is not None:
+                        request_context.timeoutNanos = (9223372036854775806
+                                                       if remaining >= 9223372036854775806 / 1_000_000_000
+                                                       else max(1, int(remaining * 1_000_000_000)))
                     self._observe("attempts")
                     self._observe_readiness()
                     try:
@@ -188,7 +214,7 @@ class ResilientRpcClient(Generic[StubType]):
 
             # The budget also covers connection lock acquisition and retry sleeps.
             try:
-                return await asyncio.wait_for(invoke(), timeout)
+                return await asyncio.wait_for(invoke(), max(0, deadline - time.monotonic()))
             except asyncio.TimeoutError as error:
                 raise self._deadline_error() from error
 

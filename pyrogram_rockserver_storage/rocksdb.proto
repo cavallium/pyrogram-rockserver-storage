@@ -37,6 +37,24 @@ enum PutBatchMode {
   SST_INGEST_BEHIND = 3;
 }
 
+enum WorkloadProfile {
+  WORKLOAD_PROFILE_UNSPECIFIED = 0;
+  CONTROL = 1;
+  LATENCY = 2;
+  ANALYTICAL = 3;
+  INGEST = 4;
+  CDC = 5;
+  BATCH = 6;
+  PHYSICAL_MAINTENANCE = 7;
+}
+
+message RequestContext {
+  WorkloadProfile profile = 1;
+  reserved 2;
+  int32 workloadContractVersion = 3;
+  int64 timeoutNanos = 4;
+}
+
 message Delta {
   optional bytes previous = 1;
   optional bytes current = 2;
@@ -67,24 +85,24 @@ message CloseTransactionResponse {bool successful = 1;}
 
 message CloseFailedUpdateRequest {int64 updateId = 1;}
 
-message CreateColumnRequest {string name = 1; ColumnSchema schema = 2;}
+message CreateColumnRequest {string name = 1; ColumnSchema schema = 2; RequestContext context = 3;}
 message CreateColumnResponse {int64 columnId = 1;}
 
-message DeleteColumnRequest {int64 columnId = 1;}
+message DeleteColumnRequest {int64 columnId = 1; RequestContext context = 2;}
 
 message GetColumnIdRequest {string name = 1;}
 message GetColumnIdResponse {int64 columnId = 1;}
 
-message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3;}
+message PutRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; KV data = 3; RequestContext context = 4;}
 
 message PutBatchInitialRequest {int64 columnId = 1; PutBatchMode mode = 2;}
 message PutBatchRequest {oneof putBatchRequestType {PutBatchInitialRequest initialRequest = 1;KVBatch data = 2;}}
 
-message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2;}
+message PutMultiInitialRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; RequestContext context = 3;}
 message PutMultiRequest {oneof putMultiRequestType {PutMultiInitialRequest initialRequest = 1;KV data = 2;}}
 message PutMultiListRequest {PutMultiInitialRequest initialRequest = 1; repeated KV data = 2;}
 
-message GetRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3;}
+message GetRequest {int64 transactionOrUpdateId = 1; int64 columnId = 2; repeated bytes keys = 3; RequestContext context = 4;}
 message GetResponse {optional bytes value = 1;}
 
 message OpenIteratorRequest {int64 transactionId = 1; int64 columnId = 2; repeated bytes startKeysInclusive = 3; repeated bytes endKeysExclusive = 4; bool reverse = 5; int64 timeoutMs = 6;}
