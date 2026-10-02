@@ -1,5 +1,5 @@
 __author__ = 'Andrea Cavalli'
-__version__ = '0.2'
+__version__ = '0.3'
 
 import asyncio
 import json
@@ -341,6 +341,7 @@ class RockServerStorage(Storage):
         self._save_user_peers = save_user_peers
 
         self._username_to_id = LRU(100_000)
+        self._peer_usernames = LRU(100_000)
         self._update_to_state = LRU(100_000)
         self._phone_to_id = LRU(100_000)
 
@@ -503,12 +504,42 @@ class RockServerStorage(Storage):
                     await asyncio.sleep(1)
                     retries += 1
 
+    def _observe_username_cache(self, event: str, value: int = 1):
+        if self._rpc_observer is not None:
+            try:
+                self._rpc_observer(event, value)
+            except (Exception, asyncio.CancelledError):
+                pass
+
+    def _username_cache_error(self, username: str, reason: Optional[str] = None):
+        # Reason counters are subsets of misses, not additional RPC outcomes.
+        self._observe_username_cache("username_cache_misses")
+        if reason is not None:
+            self._observe_username_cache(reason)
+        outcome = "expired" if reason == "username_cache_expired" else "not found"
+        return KeyError(f"Username {outcome}: {username}")
+
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
-        for t in usernames:
-            peer_id = t[0]
-            id_usernames = t[1]
-            for username in id_usernames:
+        confirmed_at = int(time.time())
+        for peer_id, id_usernames in usernames:
+            current = frozenset(username.lower() for username in id_usernames)
+            previous = self._peer_usernames.get(peer_id)
+            invalidations = 0
+            if previous is not None:
+                for username in previous[0] - current:
+                    if self._username_to_id.get(username) == peer_id:
+                        self._username_to_id.pop(username, None)
+                        if self._rpc_observer is not None:
+                            invalidations += 1
+            if current:
+                self._peer_usernames[peer_id] = (current, confirmed_at)
+            else:
+                self._peer_usernames.pop(peer_id, None)
+            for username in current:
                 self._username_to_id[username] = peer_id
+            self._observe_username_cache("username_cache_snapshots")
+            if invalidations:
+                self._observe_username_cache("username_cache_invalidations", invalidations)
 
     async def update_state(self, value: Tuple[int, int, int, int, int] = object):
         if value == object:
@@ -532,22 +563,34 @@ class RockServerStorage(Storage):
         return get_input_peer(value_tuple)
 
     async def get_peer_by_username(self, username: str):
+        username = username.lower()
         peer_id = self._username_to_id.get(username)
-
-        if peer_id is None:
-            raise KeyError(f"Username not found: {username}")
+        current = self._peer_usernames.get(peer_id) if peer_id is not None else None
+        if current is None or username not in current[0]:
+            raise self._username_cache_error(username)
+        if int(time.time() - current[1]) > self.USERNAME_TTL:
+            raise self._username_cache_error(username, "username_cache_expired")
 
         keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
         encoded_value = await fetchone(self._client, self._peer_col, keys)
+        current = self._peer_usernames.get(peer_id)
+        if (self._username_to_id.get(username) != peer_id
+                or current is None or username not in current[0]):
+            raise self._username_cache_error(username, "username_cache_changed_during_read")
+        now = time.time()
+        if int(now - current[1]) > self.USERNAME_TTL:
+            raise self._username_cache_error(username, "username_cache_expired")
         value_tuple = decode_peer_info(peer_id, encoded_value)
 
         if value_tuple is None:
-            raise KeyError(f"Username not found: {username}")
+            raise self._username_cache_error(username)
 
-        if int(time.time() - value_tuple['last_update_on']) > self.USERNAME_TTL:
-            raise KeyError(f"Username expired: {username}")
+        if int(now - value_tuple['last_update_on']) > self.USERNAME_TTL:
+            raise self._username_cache_error(username, "username_cache_expired")
 
-        return get_input_peer(value_tuple)
+        peer = get_input_peer(value_tuple)
+        self._observe_username_cache("username_cache_hits")
+        return peer
 
     async def get_peer_by_phone_number(self, phone_number: str):
         peer_id = self._phone_to_id.get(phone_number)
