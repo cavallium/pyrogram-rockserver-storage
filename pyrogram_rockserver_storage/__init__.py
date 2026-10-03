@@ -1,5 +1,5 @@
 __author__ = 'Andrea Cavalli'
-__version__ = '0.4'
+__version__ = '0.5'
 
 import asyncio
 import json
@@ -566,6 +566,11 @@ class RockServerStorage(Storage):
             self._observe_username_cache("username_cache_snapshots")
             if invalidations:
                 self._observe_username_cache("username_cache_invalidations", invalidations)
+
+    def get_cached_update_state(self, entity_id: int):
+        """Read one account-local RAM entry without sorting or Rockserver I/O."""
+        state = self._update_to_state.get(entity_id)
+        return tuple(state) if state is not None else None
 
     async def update_state(self, value: Tuple[int, int, int, int, int] = object):
         if value == object:
