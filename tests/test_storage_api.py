@@ -185,3 +185,57 @@ class StorageApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frozenset({'alias'}), self.session._peer_usernames[42][0])
         peer = storage.get_input_peer({'id': -1000000000042, 'peer_type': 'community', 'access_hash': 3})
         self.assertEqual(42, peer.channel_id)
+
+    async def test_oversized_save_preserves_previous_auth_and_cursors_without_retries(self):
+        await self.session.open()
+        await self.session.auth_key(b'a' * 256)
+        await self.session.set_update_state(UpdateState(0, 1, 2, 3, 4))
+        await self.session.save()
+        saved = self.store.rows[self.session._session_col]
+        puts = self.store.put_count
+        await self.session.set_update_state(UpdateState(0, 9, None, None, None))
+        await self.session.set_update_state(UpdateState(42, 5, None, 6, None))
+        with patch.object(self.session, 'MAX_SESSION_RECORD_BYTES', len(saved)), \
+                patch.object(storage.asyncio, 'sleep', new=AsyncMock()) as sleep:
+            with self.assertRaisesRegex(ValueError, 'previous saved session was not overwritten'):
+                await self.session.save()
+            with self.assertRaisesRegex(ValueError, 'previous saved session was not overwritten'):
+                await self.session.auth_key(b'b' * 256)
+            sleep.assert_not_awaited()
+        self.assertEqual(puts, self.store.put_count)
+        self.assertEqual(saved, self.store.rows[self.session._session_col])
+        self.assertEqual(b'b' * 256, await self.session.auth_key())
+        self.assertEqual((0, 9, 2, 3, 4), self.session.get_cached_update_state(0))
+        self.assertEqual((42, 5, None, 6, None), self.session.get_cached_update_state(42))
+        reopened = RockServerStorage('unused', 0, 'api-test', True)
+        await reopened.open()
+        self.assertEqual(b'a' * 256, await reopened.auth_key())
+        self.assertEqual([UpdateState(0, 1, 2, 3, 4)], await reopened.get_update_states())
+        await self.session.save()
+        await reopened.open()
+        self.assertEqual(b'b' * 256, await reopened.auth_key())
+        self.assertEqual(2, len(await reopened.get_update_states()))
+
+    async def test_save_retries_one_stable_snapshot_while_cursors_change(self):
+        await self.session.open()
+        await self.session.set_update_state(UpdateState(0, 1, 2, 3, 4))
+        original_put = self.store.put
+        values = []
+
+        async def put(request):
+            values.append(request.data.value)
+            if len(values) == 1:
+                await self.session.set_update_state(UpdateState(0, 9, None, None, None))
+                raise ConnectionError('first attempt failed')
+            await original_put(request)
+
+        with patch.object(self.store, 'put', new=put), \
+                patch.object(storage.asyncio, 'sleep', new=AsyncMock()):
+            await self.session.save()
+        self.assertEqual(2, len(values))
+        self.assertEqual(values[0], values[1])
+        self.assertEqual([[0, 1, 2, 3, 4]], bson.loads(values[1])['update_states'])
+        self.assertEqual((0, 9, 2, 3, 4), self.session.get_cached_update_state(0))
+        await self.session.save()
+        self.assertEqual([[0, 9, 2, 3, 4]],
+                         bson.loads(self.store.rows[self.session._session_col])['update_states'])

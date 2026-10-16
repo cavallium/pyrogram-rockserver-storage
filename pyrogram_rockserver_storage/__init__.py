@@ -1,5 +1,5 @@
 __author__ = 'Andrea Cavalli'
-__version__ = '0.6'
+__version__ = '0.6.1'
 
 import asyncio
 import json
@@ -344,6 +344,7 @@ class RockServerStorage(Storage):
     """
 
     USERNAME_TTL = 8 * 60 * 60  # pyrogram constant
+    MAX_SESSION_RECORD_BYTES = 64 * 1024 * 1024
 
     def __init__(self,
                  hostname: str,
@@ -396,6 +397,9 @@ class RockServerStorage(Storage):
     async def open(self):
         """ Initialize pyrogram session"""
         channel_options = [
+            # GetResponse has one bytes field: one tag and up to four length bytes
+            # for a session record bounded to 64 MiB.
+            ('grpc.max_receive_message_length', self.MAX_SESSION_RECORD_BYTES + 5),
             ('grpc.keepalive_time_ms', 10000),  # Send a ping every 10 seconds if no other activity
             ('grpc.keepalive_timeout_ms', 5000),  # Wait 5 seconds for the ping ack before assuming failure
             ('grpc.keepalive_permit_without_calls', True),  # Allow pings even if there are no active calls
@@ -685,12 +689,18 @@ class RockServerStorage(Storage):
         await self._save_session_data_no_lock()
 
     async def _save_session_data_no_lock(self):
+        # Freeze one snapshot before the first RPC: retries must write the same
+        # bytes even if update cursors change while the transport awaits a reply.
+        self._session_data["update_states"] = list(self._update_to_state.values())
+        encoded_session_data: bytes = bson.dumps(self._session_data)
+        if len(encoded_session_data) > self.MAX_SESSION_RECORD_BYTES:
+            raise ValueError(
+                f"Session record exceeds {self.MAX_SESSION_RECORD_BYTES} bytes; "
+                "the previous saved session was not overwritten")
         failed = True
         retries = 0
         while failed:
             try:
-                self._session_data["update_states"] = list(self._update_to_state.values())
-                encoded_session_data: bytes = bson.dumps(self._session_data)
                 await self._client.put(rockserver_storage_pb2.PutRequest(transactionOrUpdateId=0, columnId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
                 failed = False
             except Exception as e:
