@@ -1,5 +1,5 @@
 __author__ = 'Andrea Cavalli'
-__version__ = '0.5'
+__version__ = '0.6'
 
 import asyncio
 import json
@@ -8,19 +8,31 @@ import math
 import random
 import time
 from enum import Enum
+from dataclasses import dataclass
 from itertools import chain
 from string import digits
-from typing import Any, List, Tuple, Dict, Optional, cast, Type, Generic, Callable, Awaitable
+from typing import Any, List, Tuple, Dict, Optional, cast, Type, Generic, Callable, Awaitable, TypeVar
 
 import grpc.aio
 from grpc import Channel
 from pyrogram import raw, utils
 from pyrogram.storage import Storage
 
+try:
+    from pyrogram.storage import UpdateState
+except ImportError:
+    # The still-supported older SDK exposes tuple-based update_state only.
+    @dataclass(frozen=True)
+    class UpdateState:
+        id: int
+        pts: Optional[int]
+        qts: Optional[int]
+        date: Optional[int]
+        seq: Optional[int]
+
 from lru import LRU
 
 import bson
-from typing_extensions import TypeVar
 
 import pyrogram_rockserver_storage.rocksdb_pb2 as rockserver_storage_pb2
 from pyrogram_rockserver_storage.rocksdb_pb2_grpc import RocksDBServiceStub
@@ -260,6 +272,7 @@ class PeerType(Enum):
     DIRECT = 'direct'
     FORUM = 'forum'
     SUPERGROUP = 'supergroup'
+    COMMUNITY = 'community'
 
 def encode_peer_info(access_hash: int, peer_type: str, phone_number: str, last_update_on: int):
     return {"access_hash": access_hash, "peer_type": peer_type, "phone_number": phone_number, "last_update_on": last_update_on}
@@ -285,7 +298,7 @@ def get_input_peer(peer):
     if peer_type == PeerType.GROUP.value:
         return raw.types.InputPeerChat(chat_id=-peer_id)
 
-    if peer_type in {PeerType.DIRECT.value, PeerType.CHANNEL.value, PeerType.FORUM.value, PeerType.SUPERGROUP.value}:
+    if peer_type in {PeerType.DIRECT.value, PeerType.CHANNEL.value, PeerType.FORUM.value, PeerType.SUPERGROUP.value, PeerType.COMMUNITY.value}:
         return raw.types.InputPeerChannel(
             channel_id=utils.get_channel_id(peer_id),
             access_hash=access_hash
@@ -358,7 +371,9 @@ class RockServerStorage(Storage):
             "user_id": None,
             "is_bot": None,
             "phone": None,
+            "update_states": [],
         }
+        self._initial_session_data = self._session_data.copy()
         self._channel: Channel | None = None
         self._client: ResilientRpcClient[RocksDBServiceStub] | None = None
         self._hostname = hostname
@@ -368,12 +383,15 @@ class RockServerStorage(Storage):
 
         self._username_to_id = LRU(100_000)
         self._peer_usernames = LRU(100_000)
-        self._update_to_state = LRU(100_000)
+        # Update cursors must not disappear when peer-cache capacity is reached.
+        # Setters stay in RAM; the existing session-save cadence persists cursors.
+        self._update_to_state = {}
         self._phone_to_id = LRU(100_000)
 
         self._session_lock = asyncio.Lock()
 
-        super().__init__(name=self._session_id)
+        # Older Storage initialized name; the current abstract base has no init.
+        self.name = self._session_id
 
     async def open(self):
         """ Initialize pyrogram session"""
@@ -401,31 +419,23 @@ class RockServerStorage(Storage):
             }))
         ]
         self._client = ResilientRpcClient(hostname=self._hostname, port=self._port, compression=grpc.Compression.Gzip, stub_class=RocksDBServiceStub, channel_options=channel_options, observer=self._rpc_observer)
-        await self._client.connect()
+        try:
+            await self._client.connect()
+            await self.create_sessions_col()
+            await self.create_data_cols()
 
-        # Column('dc_id', BIGINT, primary_key=True),
-        # Column('api_id', BIGINT),
-        # Column('test_mode', Boolean),
-        # Column('auth_key', BYTEA),
-        # Column('date', BIGINT, nullable=False),
-        # Column('user_id', BIGINT),
-        # Column('is_bot', Boolean),
-        # Column('phone', String(length=50)
-        await self.create_sessions_col()
-
-        # Column('id', BIGINT),
-        # Column('access_hash', BIGINT),
-        # Column('type', String, nullable=False),
-        # Column('username', String),
-        # Column('phone_number', String),
-        # Column('last_update_on', BIGINT),
-        await self.create_data_cols()
-
-        async with self._session_lock:
-            fetched_session_data = await fetchone(self._client, self._session_col, SESSION_KEY)
-            if fetched_session_data is not None:
-                self._session_data.update(fetched_session_data)
-            await self._migrate_session_endpoint_no_lock()
+            async with self._session_lock:
+                fetched_session_data = await fetchone(self._client, self._session_col, SESSION_KEY)
+                self._session_data = self._initial_session_data.copy()
+                if fetched_session_data is not None:
+                    self._session_data.update(fetched_session_data)
+                self._update_to_state = {
+                    state[0]: tuple(state) for state in self._session_data["update_states"]}
+                await self._migrate_session_endpoint_no_lock()
+        except BaseException:
+            # Startup owns this newly allocated transport even on cancellation.
+            await self.close()
+            raise
 
     async def _migrate_session_endpoint_no_lock(self):
         if self._session_data.get("test_mode") is None:
@@ -470,11 +480,16 @@ class RockServerStorage(Storage):
         await self.delete_data()
         async with self._session_lock:
             await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._session_col))
+        self._session_data = self._initial_session_data.copy()
+        self._update_to_state.clear()
         await self.create_sessions_col()
 
     async def delete_data(self):
         """ Delete only data, keep session """
         await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._peer_col))
+        self._username_to_id.clear()
+        self._peer_usernames.clear()
+        self._phone_to_id.clear()
         await self.create_data_cols()
 
     # peer_id, access_hash, peer_type, phone_number
@@ -548,7 +563,7 @@ class RockServerStorage(Storage):
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
         confirmed_at = int(time.time())
         for peer_id, id_usernames in usernames:
-            current = frozenset(username.lower() for username in id_usernames)
+            current = frozenset(username.lower() for username in id_usernames if username)
             previous = self._peer_usernames.get(peer_id)
             invalidations = 0
             if previous is not None:
@@ -572,14 +587,40 @@ class RockServerStorage(Storage):
         state = self._update_to_state.get(entity_id)
         return tuple(state) if state is not None else None
 
-    async def update_state(self, value: Tuple[int, int, int, int, int] = object):
-        if value == object:
-            return sorted(self._update_to_state.values(), key=lambda x: x[3], reverse=False)
+    async def get_update_states(self, ids=None):
+        if ids is None:
+            states = self._update_to_state.values()
         else:
-            if isinstance(value, int):
-                self._update_to_state.pop(value)
-            else:
-                self._update_to_state[value[0]] = value
+            state_ids = (ids,) if isinstance(ids, int) else dict.fromkeys(ids)
+            states = (self._update_to_state[state_id] for state_id in state_ids
+                      if state_id in self._update_to_state)
+        # SQLite orders nullable dates first, then ascending timestamps.
+        return [UpdateState(*state) for state in sorted(
+            states, key=lambda state: (state[3] is not None, state[3] or 0))]
+
+    async def set_update_state(self, update_state):
+        states = (update_state,) if isinstance(update_state, UpdateState) else update_state
+        for state in states:
+            previous = self._update_to_state.get(state.id, (state.id, None, None, None, None))
+            values = (state.id, state.pts, state.qts, state.date, state.seq)
+            self._update_to_state[state.id] = tuple(
+                old if new is None else new for old, new in zip(previous, values))
+
+    async def delete_update_state(self, state_id):
+        state_ids = (state_id,) if isinstance(state_id, int) else state_id
+        for state_id in state_ids:
+            self._update_to_state.pop(state_id, None)
+
+    async def update_state(self, value=object):
+        """Legacy SDK tuple interface; new SDK callers use the methods above."""
+        if value is object:
+            return [(state.id, state.pts, state.qts, state.date, state.seq)
+                    for state in await self.get_update_states()]
+        if isinstance(value, int):
+            await self.delete_update_state(value)
+        else:
+            # Legacy setters replace the entire tuple rather than merging fields.
+            self._update_to_state[value[0]] = tuple(value)
 
     async def get_peer_by_id(self, peer_id: int):
         if isinstance(peer_id, str) or (not self._save_user_peers and peer_id > 0):
@@ -648,6 +689,7 @@ class RockServerStorage(Storage):
         retries = 0
         while failed:
             try:
+                self._session_data["update_states"] = list(self._update_to_state.values())
                 encoded_session_data: bytes = bson.dumps(self._session_data)
                 await self._client.put(rockserver_storage_pb2.PutRequest(transactionOrUpdateId=0, columnId=self._session_col, data=rockserver_storage_pb2.KV(keys=SESSION_KEY, value=encoded_session_data)))
                 failed = False
