@@ -7,6 +7,7 @@ import logging
 import math
 import random
 import time
+from collections import OrderedDict
 from enum import Enum
 from dataclasses import dataclass
 from itertools import chain
@@ -30,12 +31,80 @@ except ImportError:
         date: Optional[int]
         seq: Optional[int]
 
-from lru import LRU
-
 import bson
 
 import pyrogram_rockserver_storage.rocksdb_pb2 as rockserver_storage_pb2
 from pyrogram_rockserver_storage.rocksdb_pb2_grpc import RocksDBServiceStub
+
+_MISSING = object()
+
+
+class BoundedLRU(OrderedDict):
+    """Pure-Python bounded LRU cache backed by ``OrderedDict``."""
+
+    def __init__(self, maxsize: int = 100_000, *args: Any, **kwargs: Any) -> None:
+        if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize <= 0:
+            raise ValueError("maxsize must be a positive integer")
+        self.maxsize = maxsize
+        super().__init__(*args, **kwargs)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+
+    def get_size(self) -> int:
+        return self.maxsize
+
+    def set_size(self, maxsize: int) -> None:
+        if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize <= 0:
+            raise ValueError("maxsize must be a positive integer")
+        self.maxsize = maxsize
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+
+    def __getitem__(self, key: Any) -> Any:
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key not in self:
+            return default
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+            return
+        super().__setitem__(key, value)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
+
+    def update(self, other: Any = (), /, **kwargs: Any) -> None:
+        if hasattr(other, "items"):
+            for key, value in other.items():
+                self[key] = value
+        elif hasattr(other, "keys"):
+            for key in other.keys():
+                self[key] = other[key]
+        else:
+            for key, value in other:
+                self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
+
+    def copy(self) -> "BoundedLRU":
+        return BoundedLRU(self.maxsize, self.items())
+
+
+LRU = BoundedLRU
 
 SESSION_KEY = [bytes([0])]
 DIGITS = set(digits)
@@ -351,13 +420,20 @@ class RockServerStorage(Storage):
                  port: int,
                  session_unique_name: str,
                  save_user_peers: bool,
-                 rpc_observer: Optional[Callable[[str, float], None]] = None):
+                 rpc_observer: Optional[Callable[[str, float], None]] = None,
+                 compression: Optional[grpc.Compression] = grpc.Compression.Gzip,
+                 peer_cache_size: int = 100_000):
         """
         :param hostname: rocksdb hostname
         :param port: rocksdb port
         :param session_unique_name: telegram session phone
+        :param save_user_peers: whether user peers are persisted and cached
+        :param rpc_observer: optional local RPC telemetry hook
+        :param compression: gRPC channel compression (use ``grpc.Compression.NoCompression`` on LAN)
+        :param peer_cache_size: maximum entries retained in the in-memory ``get_peer_by_id`` LRU cache
         """
         self._rpc_observer = rpc_observer
+        self._compression = compression
         self._session_col = None
         self._peer_col = None
         self._session_id = f'{session_unique_name}'
@@ -382,12 +458,14 @@ class RockServerStorage(Storage):
 
         self._save_user_peers = save_user_peers
 
-        self._username_to_id = LRU(100_000)
-        self._peer_usernames = LRU(100_000)
+        self._username_to_id = BoundedLRU(100_000)
+        self._peer_usernames = BoundedLRU(100_000)
         # Update cursors must not disappear when peer-cache capacity is reached.
         # Setters stay in RAM; the existing session-save cadence persists cursors.
         self._update_to_state = {}
-        self._phone_to_id = LRU(100_000)
+        self._phone_to_id = BoundedLRU(100_000)
+        self._peer_cache = BoundedLRU(peer_cache_size)
+        self._peer_cache_epoch = 0
 
         self._session_lock = asyncio.Lock()
 
@@ -422,7 +500,7 @@ class RockServerStorage(Storage):
                 }
             }))
         ]
-        self._client = ResilientRpcClient(hostname=self._hostname, port=self._port, compression=grpc.Compression.Gzip, stub_class=RocksDBServiceStub, channel_options=channel_options, observer=self._rpc_observer)
+        self._client = ResilientRpcClient(hostname=self._hostname, port=self._port, compression=self._compression, stub_class=RocksDBServiceStub, channel_options=channel_options, observer=self._rpc_observer)
         try:
             await self._client.connect()
             await self.create_sessions_col()
@@ -481,20 +559,32 @@ class RockServerStorage(Storage):
 
     async def delete(self):
         """ Delete all the tables and indexes """
-        await self.delete_data()
-        async with self._session_lock:
-            await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._session_col))
-        self._session_data = self._initial_session_data.copy()
-        self._update_to_state.clear()
-        await self.create_sessions_col()
+        self._peer_cache_epoch += 1
+        self._peer_cache.clear()
+        try:
+            await self.delete_data()
+            async with self._session_lock:
+                await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._session_col))
+            self._session_data = self._initial_session_data.copy()
+            self._update_to_state.clear()
+            await self.create_sessions_col()
+        finally:
+            self._peer_cache_epoch += 1
+            self._peer_cache.clear()
 
     async def delete_data(self):
         """ Delete only data, keep session """
-        await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._peer_col))
-        self._username_to_id.clear()
-        self._peer_usernames.clear()
-        self._phone_to_id.clear()
-        await self.create_data_cols()
+        self._peer_cache_epoch += 1
+        self._peer_cache.clear()
+        try:
+            await self._client.deleteColumn(rockserver_storage_pb2.DeleteColumnRequest(columnId=self._peer_col))
+            self._username_to_id.clear()
+            self._peer_usernames.clear()
+            self._phone_to_id.clear()
+            await self.create_data_cols()
+        finally:
+            self._peer_cache_epoch += 1
+            self._peer_cache.clear()
 
     # peer_id, access_hash, peer_type, phone_number
     async def update_peers(self, peers: List[Tuple[int, int, str, str]]):
@@ -519,6 +609,11 @@ class RockServerStorage(Storage):
 
         # construct insert query
         if deduplicated_peers:
+            self._peer_cache_epoch += 1
+            write_epoch = self._peer_cache_epoch
+            for deduplicated_peer in deduplicated_peers:
+                self._peer_cache.pop(deduplicated_peer[0], None)
+
             failed = True
             retries = 0
             while failed:
@@ -548,6 +643,24 @@ class RockServerStorage(Storage):
                 if failed:
                     await asyncio.sleep(1)
                     retries += 1
+
+            if self._peer_cache_epoch == write_epoch:
+                for deduplicated_peer in deduplicated_peers:
+                    peer_id = deduplicated_peer[0]
+                    if not self._save_user_peers and peer_id > 0:
+                        continue
+                    try:
+                        input_peer = get_input_peer(
+                            {
+                                "id": peer_id,
+                                "access_hash": deduplicated_peer[1],
+                                "peer_type": deduplicated_peer[2],
+                            }
+                        )
+                    except ValueError:
+                        self._peer_cache.pop(peer_id, None)
+                    else:
+                        self._peer_cache[peer_id] = input_peer
 
     def _observe_username_cache(self, event: str, value: int = 1):
         if self._rpc_observer is not None:
@@ -630,13 +743,21 @@ class RockServerStorage(Storage):
         if isinstance(peer_id, str) or (not self._save_user_peers and peer_id > 0):
             raise KeyError(f"ID not found: {peer_id}")
 
+        cached = self._peer_cache.get(peer_id, _MISSING)
+        if cached is not _MISSING:
+            return cached
+
+        epoch = self._peer_cache_epoch
         keys = [peer_id.to_bytes(8, byteorder='big', signed=True)]
         encoded_value = await fetchone(self._client, self._peer_col, keys)
         value_tuple = decode_peer_info(peer_id, encoded_value)
         if value_tuple is None:
             raise KeyError(f"ID not found: {peer_id}")
 
-        return get_input_peer(value_tuple)
+        peer = get_input_peer(value_tuple)
+        if self._peer_cache_epoch == epoch:
+            self._peer_cache[peer_id] = peer
+        return peer
 
     async def get_peer_by_username(self, username: str):
         username = username.lower()

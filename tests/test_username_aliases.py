@@ -2,8 +2,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from lru import LRU
 import pyrogram_rockserver_storage as storage
+from pyrogram_rockserver_storage import BoundedLRU
 
 
 class UsernameAliasTests(unittest.IsolatedAsyncioTestCase):
@@ -67,7 +67,7 @@ class UsernameAliasTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(100_000, self.storage._username_to_id.get_size())
 
     async def test_reverse_proof_eviction_is_miss_even_if_forward_binding_remains(self):
-        self.storage._peer_usernames = LRU(1)
+        self.storage._peer_usernames = BoundedLRU(1)
         await self.storage.update_usernames([(self.peer_id, ['old'])])
         await self.storage.update_usernames([(self.other_id, ['other'])])
         self.assertEqual(self.peer_id, self.storage._username_to_id['old'])
@@ -96,7 +96,7 @@ class UsernameAliasTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, self.read.await_count)
 
     async def test_current_alias_proof_is_rechecked_after_fetch(self):
-        self.storage._peer_usernames = LRU(1)
+        self.storage._peer_usernames = BoundedLRU(1)
         await self.storage.update_usernames([(self.peer_id, ['shared'])])
         entered, release = asyncio.Event(), asyncio.Event()
         async def read(*args):
@@ -156,7 +156,7 @@ class UsernameAliasTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(42, (await self.storage.get_peer_by_username('current')).channel_id)
 
     async def test_empty_snapshots_do_not_evict_useful_named_peer_proof(self):
-        self.storage._peer_usernames = LRU(1)
+        self.storage._peer_usernames = BoundedLRU(1)
         await self.storage.update_usernames([(self.peer_id, ['current'])])
         for peer_id in range(100):
             await self.storage.update_usernames([(peer_id, [])])
